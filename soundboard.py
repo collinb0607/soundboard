@@ -188,7 +188,8 @@ class Store:
 
 def new_sound(name, audio, color):
     return {"id": new_id(), "name": name, "audio": audio, "hotkey": "", "volume": 100, "color": color,
-            "icon": {"kind": "none", "value": ""}, "size": 2, "x": 0, "y": 0}
+            "icon": {"kind": "none", "value": ""}, "size": 2, "x": 0, "y": 0,
+            "trim": None}  # trim: [start s, end s] of the part that plays, or None for all of it
 
 
 # ---- the grid ---------------------------------------------------------------- #
@@ -404,11 +405,24 @@ def gradient_pill(w, h, r, bg):
 # --------------------------------------------------------------------------- #
 #  Sound: reading files, and playing them into one or two devices
 # --------------------------------------------------------------------------- #
-def read_audio(path):
-    """(sample rate, float32 stereo array) from a WAV / MP3 / OGG / FLAC file."""
+def trim_frames(path, trim):
+    """(start, stop) frames of a sound's trimmed part ((0, None) = the whole file)."""
+    if not trim:
+        return 0, None
+    import soundfile as sf
+    info = sf.info(path)
+    start = max(0, min(info.frames - 1, int(round(trim[0] * info.samplerate))))
+    stop = max(start + 1, min(info.frames, int(round(trim[1] * info.samplerate))))
+    return start, stop
+
+
+def read_audio(path, trim=None):
+    """(sample rate, float32 stereo array) from a WAV / MP3 / OGG / FLAC file, or just its
+    trimmed part [start s, end s] (only that part is read, so a long file stays cheap)."""
     import numpy as np
     import soundfile as sf
-    data, rate = sf.read(path, dtype="float32", always_2d=True)
+    start, stop = trim_frames(path, trim)
+    data, rate = sf.read(path, start=start, stop=stop, dtype="float32", always_2d=True)
     if data.shape[1] == 1:
         data = np.repeat(data, 2, axis=1)
     elif data.shape[1] > 2:
@@ -428,6 +442,20 @@ def resample(data, rate, to):
     for c in range(data.shape[1]):
         out[:, c] = np.interp(x, idx, data[:, c])
     return out
+
+
+_LENGTHS = {}
+
+
+def audio_length(path):
+    """A sound file's length in seconds (0 if it can't be read)."""
+    if path not in _LENGTHS:
+        try:
+            import soundfile as sf
+            _LENGTHS[path] = sf.info(path).duration
+        except Exception:
+            _LENGTHS[path] = 0.0
+    return _LENGTHS[path]
 
 
 def check_audio(path):
@@ -508,46 +536,48 @@ class Engine:
         self.mic_gain = 1.0
         self.mic_buf = deque()
         self.mic_frames = 0
-        self.decoded = {}  # path -> (rate, data), oldest first
-        self.resampled = {}  # (path, rate) -> data
+        self.decoded = {}  # (path, trim) -> (rate, data), oldest first
+        self.resampled = {}  # (path, trim, rate) -> data
         self.errors = deque()
 
     # ---- decoding ------------------------------------------------------ #
-    def decode(self, path):
+    @staticmethod
+    def _key(path, trim):
+        return path, (tuple(trim) if trim else None)
+
+    def decode(self, path, trim=None):
+        key = self._key(path, trim)
         with self.lock:
-            if path in self.decoded:
-                self.decoded[path] = self.decoded.pop(path)  # most recently used goes last
-                return self.decoded[path]
-        rate, data = read_audio(path)
+            if key in self.decoded:
+                self.decoded[key] = self.decoded.pop(key)  # most recently used goes last
+                return self.decoded[key]
+        rate, data = read_audio(path, trim)
         with self.lock:
-            self.decoded[path] = (rate, data)
+            self.decoded[key] = (rate, data)
             total = sum(d.nbytes for _, d in self.decoded.values())
             while total > self.MAX_CACHE and len(self.decoded) > 1:
                 old = next(iter(self.decoded))
                 total -= self.decoded.pop(old)[1].nbytes
-                for key in [k for k in self.resampled if k[0] == old]:
-                    del self.resampled[key]
+                for k in [k for k in self.resampled if k[:2] == old]:
+                    del self.resampled[k]
         return rate, data
 
-    def prepare(self, path):
+    def prepare(self, path, trim=None):
         """Decode (and resample for each device) now, so the first press is instant."""
-        rate, data = self.decode(path)
         with self.lock:
             rates = {o["rate"] for o in self.outs.values()}
         for r in rates:
-            if (path, r) not in self.resampled:
-                d = resample(data, rate, r)
-                with self.lock:
-                    self.resampled[(path, r)] = d
+            self.samples(path, r, trim)
 
-    def samples(self, path, to):
+    def samples(self, path, to, trim=None):
+        key = self._key(path, trim) + (to,)
         with self.lock:
-            d = self.resampled.get((path, to))
+            d = self.resampled.get(key)
         if d is None:
-            rate, data = self.decode(path)
+            rate, data = self.decode(path, trim)
             d = resample(data, rate, to)
             with self.lock:
-                self.resampled[(path, to)] = d
+                self.resampled[key] = d
         return d
 
     # ---- devices ------------------------------------------------------- #
@@ -729,12 +759,15 @@ class Engine:
         return cb
 
     # ---- playing -------------------------------------------------------- #
-    def play(self, sound_id, name, path, gain):
+    def play(self, sound_id, name, path, gain, trim=None, preview=False):
+        """preview: only on your own speakers / headphones (not into the call), if they're open."""
         with self.lock:
             outs = dict(self.outs)
         if not outs:
             raise RuntimeError("No output device is open. Choose one in Configure.")
-        data = {role: self.samples(path, o["rate"]) for role, o in outs.items()}
+        if preview:
+            outs = {r: o for r, o in outs.items() if r == ("monitor" if "monitor" in outs else "main")}
+        data = {role: self.samples(path, o["rate"], trim) for role, o in outs.items()}
         v = Voice(sound_id, name, data, gain)
         with self.lock:
             self.voices = [x for x in self.voices if x.sound_id != sound_id] + [v]
@@ -884,13 +917,40 @@ def _pack_sound(z, s, prefix=""):
     audio = s["audio"]
     ext = os.path.splitext(audio)[1].lower() or ".wav"
     apath = f"{prefix}audio{ext}"
-    z.write(library_path(audio), apath)
+    if s.get("trim"):
+        z.writestr(apath, trimmed_audio(library_path(audio), s["trim"]))
+    else:
+        z.write(library_path(audio), apath)
     icon = dict(s.get("icon") or {"kind": "none", "value": ""})
     if icon.get("kind") == "image":
         ipath = f"{prefix}icon.png"
         z.write(library_path(icon["value"]), ipath)
         icon = {"kind": "image", "value": ipath}
     return {"name": s["name"], "color": s["color"], "size": s["size"], "icon": icon, "audio": apath}
+
+
+def trimmed_audio(path, trim):
+    """Just the trimmed part of a sound file, as the bytes of a file in the same format
+    (so a shared sound never carries the rest of a long recording)."""
+    import soundfile as sf
+    info = sf.info(path)
+    start, stop = trim_frames(path, trim)
+    data, rate = sf.read(path, start=start, stop=stop, dtype="float32", always_2d=True)
+    ext = os.path.splitext(path)[1].lower()
+    fd, tmp = tempfile.mkstemp(suffix=ext)
+    os.close(fd)
+    try:
+        try:
+            sf.write(tmp, data, rate, format=info.format, subtype=info.subtype)
+        except Exception:  # a subtype libsndfile can read but not write: plain 16-bit
+            sf.write(tmp, data, rate, format=info.format, subtype=sf.default_subtype(info.format))
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _unpack_sound(z, e):
@@ -1128,6 +1188,155 @@ def ask_text(parent, title, prompt, initial=""):
     return result.get("v")
 
 
+CABLE_URL = "https://existential.audio/blackhole/" if sys.platform == "darwin" else "https://vb-audio.com/Cable/"
+CABLE_NAME = "BlackHole 2ch" if sys.platform == "darwin" else "VB-CABLE"
+
+
+def is_cable(name):
+    """A virtual audio cable's playback side (where the soundboard sends sound)."""
+    n = (name or "").lower()
+    return any(k in n for k in ("cable input", "vb-audio", "blackhole", "voicemeeter input", "virtual cable"))
+
+
+def is_cable_mic(name):
+    """A virtual audio cable's recording side (what Discord uses as its microphone)."""
+    n = (name or "").lower()
+    return any(k in n for k in ("cable output", "vb-audio", "blackhole", "voicemeeter out", "virtual cable"))
+
+
+class DiscordSetup:
+    """Sets the soundboard up so a Discord call hears the sounds and your voice, and you
+    hear the sounds in your headphones; then says what to set in Discord."""
+
+    def __init__(self, parent, app):
+        self.app = app
+        self.top = top = dialog(parent, "Set up for Discord")
+        self.box = ttk.Frame(top, padding=18, style="App.TFrame")
+        self.box.pack(fill="both", expand=True)
+        top.bind("<Escape>", lambda e: top.destroy())
+        self.fill()
+        show_modal(top, parent)
+
+    def _card(self, title, icon):
+        f = section(self.box, title, icon, padding=(4, 2))
+        f.pack(fill="x", pady=(10, 0))
+        return f
+
+    def _text(self, parent, text, muted=True, bold=False, color=None):
+        fam = ui_family()
+        lbl = ttk.Label(parent, text=text, wraplength=600, justify="left",
+                        foreground=color or (UI["muted"] if muted else UI["text"]),
+                        font=(fam, 10, "bold") if bold else (fam, 10))
+        lbl.pack(anchor="w", pady=(0, 4))
+        return lbl
+
+    def fill(self):
+        for w in self.box.winfo_children():
+            w.destroy()
+        t, fam = UI, ui_family()
+        s = self.app.store.settings
+        try:
+            outs = [n for _, n in list_devices("output")[0]]
+            ins, d_in = list_devices("input")
+            ins = [n for _, n in ins]
+            d_out = list_devices("output")[1]
+        except Exception as e:
+            outs, ins, d_in, d_out = [], [], "", ""
+            log_error(f"Discord setup: {e}")
+        cables = [n for n in outs if is_cable(n)]
+        speakers = [n for n in outs if not is_cable(n)]
+        mics = [n for n in ins if not is_cable_mic(n)]
+        cable_mics = [n for n in ins if is_cable_mic(n)]
+
+        ttk.Label(self.box, text="Set up for Discord", style="App.TLabel", font=(fam, 15, "bold")).pack(anchor="w")
+        ttk.Label(self.box, text="Discord hears the soundboard through a virtual audio cable: the sounds go into "
+                                 "the cable, and Discord uses the cable as its microphone. Your voice is mixed "
+                                 "in too, and you hear the sounds in your headphones.",
+                  style="App.TLabel", foreground=t["muted"], wraplength=620, justify="left").pack(anchor="w",
+                                                                                               pady=(4, 0))
+
+        # 1. The cable.
+        c = self._card("1. A virtual audio cable", "volume-2")
+        self.v_cable = tk.StringVar(value=s["output"] if s["output"] in cables else (cables[0] if cables else ""))
+        if cables:
+            self._text(c, "Found it. The sounds and your voice will go into:", muted=False)
+            if len(cables) > 1:
+                ttk.Combobox(c, values=cables, textvariable=self.v_cable, state="readonly", width=48).pack(
+                    anchor="w", pady=(0, 4))
+            else:
+                self._text(c, self.v_cable.get(), muted=False, bold=True)
+        else:
+            self._text(c, f"Not installed yet. {CABLE_NAME} is free and takes a minute:", muted=False,
+                       color=t["error"])
+            if sys.platform == "darwin":
+                steps = "Download BlackHole 2ch, run its installer, then click Check again."
+            else:
+                steps = ("Download VB-CABLE and unzip it. Right-click VBCABLE_Setup_x64.exe, choose Run as "
+                         "administrator, click Install Driver, then restart your PC and click Check again.")
+            self._text(c, steps)
+            row = ttk.Frame(c)
+            row.pack(anchor="w", pady=(2, 2))
+            ttk.Button(row, text=f"Download {CABLE_NAME}", command=self.download,
+                       image=ui_icon(row, "download", 15), compound="left").pack(side="left")
+            ttk.Button(row, text="Check again", command=self.check_again,
+                       image=ui_icon(row, "rotate-cw", 15), compound="left").pack(side="left", padx=(6, 0))
+
+        # 2 and 3. Headphones and mic.
+        c = self._card("2. Where you hear the sounds", "headphones")
+        mon = s["monitor"] if s["monitor"] in speakers else (d_out if d_out in speakers else
+                                                             (speakers[0] if speakers else ""))
+        self.v_phones = tk.StringVar(value=mon)
+        ttk.Combobox(c, values=speakers, textvariable=self.v_phones, state="readonly", width=48).pack(anchor="w")
+        c = self._card("3. Your microphone", "mic")
+        mic = s["mic"] if s["mic"] in mics else (d_in if d_in in mics else (mics[0] if mics else ""))
+        self.v_mic = tk.StringVar(value=mic)
+        ttk.Combobox(c, values=mics, textvariable=self.v_mic, state="readonly", width=48).pack(anchor="w")
+
+        row = ttk.Frame(self.box, style="App.TFrame")
+        row.pack(fill="x", pady=(12, 0))
+        self.apply_btn = PillButton(row, "Apply these settings", self.apply, icon="save", height=44)
+        self.apply_btn.pack(side="left")
+        self.apply_btn.set_enabled(bool(cables and self.v_phones.get() and self.v_mic.get()))
+        self.done_lbl = ttk.Label(row, text="", style="App.TLabel", foreground=t["purple"])
+        self.done_lbl.pack(side="left", padx=(12, 0))
+
+        # 4. Discord.
+        c = self._card("4. In Discord: User Settings → Voice & Video", "settings")
+        cm = cable_mics[0] if cable_mics else ("BlackHole 2ch" if sys.platform == "darwin" else
+                                               "CABLE Output (VB-Audio Virtual Cable)")
+        for line in (f"Input Device: {cm}",
+                     "Output Device: your headphones, as before",
+                     "Noise Suppression: None (otherwise Discord filters the sounds out as noise)",
+                     "If sounds are choppy or quiet, turn off Echo Cancellation and Automatic Gain Control",
+                     "Push to Talk? Others only hear sounds while you hold the key. Voice Activity "
+                     "lets them through on their own",
+                     "Check: click Let's Check under Mic Test, then play a sound"):
+            self._text(c, "•  " + line, muted=False)
+        self._text(c, "Keep the soundboard open during calls: while it's closed, Discord hears nothing from your "
+                      "mic. (Or switch Discord's input back to your microphone.)")
+        end = ttk.Frame(self.box, style="App.TFrame")
+        end.pack(fill="x", pady=(12, 0))
+        ttk.Button(end, text="Close", command=self.top.destroy, style="App.TButton").pack(side="right")
+
+    def download(self):
+        import webbrowser
+        webbrowser.open(CABLE_URL)
+
+    def check_again(self):
+        self.app.refresh_devices()
+        self.fill()
+
+    def apply(self):
+        app = self.app
+        app.v_output.set(self.v_cable.get())
+        app.v_mon_on.set(True)
+        app.v_monitor.set(self.v_phones.get())
+        app.v_mic_on.set(True)
+        app.v_mic.set(self.v_mic.get())
+        app.devices_changed()
+        self.done_lbl.config(text="Done. Now set up Discord (step 4).")
+
+
 class StickerPicker:
     """Choose one of the built-in stickers: a searchable grid."""
     THUMB, COLS = 76, 7
@@ -1206,6 +1415,349 @@ class StickerPicker:
     def pick(self, sid):
         self.top.destroy()
         self.on_pick(sid)
+
+
+def fmt_time(secs, precise=True):
+    """1:02:03.45 / 2:03.45 / 0:03.45 (or without hundredths)."""
+    secs = max(0.0, secs)
+    m, sec = divmod(secs, 60)
+    h, m = divmod(int(m), 60)
+    sec_txt = f"{sec:05.2f}" if precise else f"{int(sec):02d}"
+    return f"{h}:{m:02d}:{sec_txt}" if h else f"{m}:{sec_txt}"
+
+
+def parse_time(text):
+    """Seconds from "1:02:03.5", "2:03.5" or "123.5"; None if it isn't a time."""
+    try:
+        parts = [float(p) for p in text.strip().split(":")]
+    except ValueError:
+        return None
+    if not parts or len(parts) > 3 or any(p < 0 for p in parts):
+        return None
+    secs = 0.0
+    for p in parts:
+        secs = secs * 60 + p
+    return secs
+
+
+class TrimDialog:
+    """Choose the part of a sound that plays: drag across the waveform to draw a box around
+    it, drag its edges (or its middle) to adjust it, and zoom in with the mouse wheel."""
+    W, H, RULER = 860, 190, 22
+    HOP = 256  # waveform resolution: one min/max pair per 256 samples
+    _play_from = _play_to = 0.0
+    playhead = None
+
+    def __init__(self, parent, app, path, trim, name, volume, on_done):
+        import soundfile as sf
+        self.app, self.path, self.on_done, self.name, self.volume = app, path, on_done, name, volume
+        info = sf.info(path)
+        self.rate, self.frames = info.samplerate, info.frames
+        self.dur = self.frames / self.rate
+        self.sel = [min(trim[0], self.dur), min(trim[1], self.dur)] if trim else [0.0, self.dur]
+        self.view = [0.0, self.dur]
+        self.min_span = min(self.dur, 0.25)
+        self.peaks = None
+        self.progress = 0.0
+        self.closed = False
+        self.drag = None
+        t, fam = UI, ui_family()
+        self.top = top = dialog(parent, "Trim sound")
+        box = ttk.Frame(top, padding=16, style="App.TFrame")
+        box.pack(fill="both", expand=True)
+        head = ttk.Frame(box, style="App.TFrame")
+        head.pack(fill="x")
+        ttk.Label(head, text=name, style="App.TLabel", font=(fam, 13, "bold")).pack(side="left")
+        ttk.Label(head, text=f"   {fmt_time(self.dur)} long", style="App.TLabel",
+                  foreground=t["muted"]).pack(side="left")
+        ttk.Label(box, text="Drag across the waveform to draw a box around the part that plays. Drag its edges "
+                            "to adjust it, or the bar along its top to move it. The mouse wheel zooms in and out.",
+                  style="App.TLabel", foreground=t["muted"]).pack(anchor="w", pady=(4, 8))
+        sheet = ttk.Frame(box, style="Sheet.TFrame", padding=10)
+        sheet.pack(fill="x")
+        self.c = tk.Canvas(sheet, width=self.W, height=self.H + self.RULER, bg="#ffffff", highlightthickness=0,
+                           bd=0, cursor="crosshair")
+        self.c.pack()
+        self.sb = ttk.Scrollbar(sheet, orient="horizontal", command=self._xview)
+        self.sb.pack(fill="x", pady=(6, 0))
+
+        row = ttk.Frame(box, style="App.TFrame")
+        row.pack(fill="x", pady=(10, 0))
+        self.v_start, self.v_end = tk.StringVar(), tk.StringVar()
+        self._entries = ()
+        for label, var in (("Start", self.v_start), ("End", self.v_end)):
+            ttk.Label(row, text=label, style="App.TLabel", font=(fam, 10, "bold")).pack(side="left", padx=(0, 6))
+            e = ttk.Entry(row, textvariable=var, width=11)
+            e.pack(side="left", padx=(0, 16))
+            e.bind("<Return>", lambda ev: self._typed())
+            e.bind("<FocusOut>", lambda ev: self._typed())
+            self._entries += (e,)
+        self.len_lbl = ttk.Label(row, text="", style="App.TLabel", foreground=t["muted"])
+        self.len_lbl.pack(side="left")
+        for text, icon, cmd in (("Show all", "minimize-2", self.show_all),
+                                ("Zoom to selection", "zoom-in", self.zoom_selection),
+                                ("Select all", "maximize", self.select_all)):
+            ttk.Button(row, text=text, command=cmd, style="App.TButton", image=ui_icon(row, icon, 15),
+                       compound="left").pack(side="right", padx=(6, 0))
+        btns = ttk.Frame(box, style="App.TFrame")
+        btns.pack(fill="x", pady=(14, 0))
+        ttk.Button(btns, text="Play selection", command=self.play, style="App.TButton",
+                   image=ui_icon(btns, "play", 15), compound="left").pack(side="left")
+        ttk.Button(btns, text="Stop", command=self.stop, style="App.TButton",
+                   image=ui_icon(btns, "square-solid", 15), compound="left").pack(side="left", padx=(6, 0))
+        ttk.Label(btns, text="Plays on your own speakers or headphones only.", style="App.TLabel",
+                  foreground=t["muted"]).pack(side="left", padx=(10, 0))
+        PillButton(btns, "Use selection", self.done, icon="scissors", height=44).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self.close, style="Link.TButton").pack(side="right", padx=6)
+
+        self.c.bind("<ButtonPress-1>", self._press)
+        self.c.bind("<B1-Motion>", self._motion)
+        self.c.bind("<ButtonRelease-1>", lambda e: setattr(self, "drag", None))
+        self.c.bind("<Motion>", self._hover)
+        self.c.bind("<MouseWheel>", lambda e: self._zoom(e.x, 0.8 if e.delta > 0 else 1.25))
+        self.c.bind("<Button-4>", lambda e: self._zoom(e.x, 0.8))
+        self.c.bind("<Button-5>", lambda e: self._zoom(e.x, 1.25))
+        top.bind("<Escape>", lambda e: self.close())
+        top.protocol("WM_DELETE_WINDOW", self.close)
+        self.c.focus_set()
+        threading.Thread(target=self._read_peaks, daemon=True).start()
+        self._poll()
+        show_modal(top, parent)
+
+    # ---- the waveform -------------------------------------------------- #
+    def _read_peaks(self):
+        """Min/max of every HOP samples, read in blocks so an hour-long file is fine."""
+        import numpy as np
+        import soundfile as sf
+        mins, maxs, done = [], [], 0
+        try:
+            for block in sf.blocks(self.path, blocksize=self.HOP * 4096, dtype="float32", always_2d=True):
+                if self.closed:
+                    return
+                mono = block.mean(axis=1)
+                n = len(mono) // self.HOP * self.HOP
+                if n:
+                    m = mono[:n].reshape(-1, self.HOP)
+                    mins.append(m.min(axis=1))
+                    maxs.append(m.max(axis=1))
+                if n < len(mono):
+                    mins.append(np.array([mono[n:].min()]))
+                    maxs.append(np.array([mono[n:].max()]))
+                done += len(block)
+                self.progress = done / max(1, self.frames)
+            self.peaks = (np.concatenate(mins), np.concatenate(maxs)) if mins else (np.zeros(1), np.zeros(1))
+        except Exception as e:
+            log_error(f"Reading the waveform of {self.path}: {e}")
+            self.peaks = (np.zeros(1), np.zeros(1))
+
+    def _poll(self):
+        if self.closed:
+            return
+        playing = [p for p in self.app.engine.playing() if p[0] == "__trim__"]
+        self.playhead = (self._play_from + (self._play_to - self._play_from) * playing[0][2]) if playing else None
+        self.redraw()
+        self.top.after(40 if (playing or self.peaks is None) else 250, self._poll)
+
+    def x_of(self, secs):
+        v0, v1 = self.view
+        return (secs - v0) / max(1e-9, v1 - v0) * self.W
+
+    def t_of(self, x):
+        v0, v1 = self.view
+        return min(self.dur, max(0.0, v0 + x / self.W * (v1 - v0)))
+
+    def redraw(self):
+        import numpy as np
+        c, W, H, R = self.c, self.W, self.H, self.RULER
+        t, fam = UI, ui_family()
+        c.delete("all")
+        v0, v1 = self.view
+        xs, xe = self.x_of(self.sel[0]), self.x_of(self.sel[1])
+        c.create_rectangle(max(0, xs), R, min(W, xe), R + H, fill=t["select"], outline="")
+        mid = R + H / 2
+        if self.peaks is None:
+            c.create_text(W / 2, mid, text=f"Reading the sound… {self.progress:.0%}", fill=t["muted"],
+                          font=(fam, 11))
+        else:
+            lo, hi = self.peaks
+            n = len(lo)
+            i0 = v0 * self.rate / self.HOP
+            i1 = v1 * self.rate / self.HOP
+            edges = np.clip((i0 + (i1 - i0) * np.arange(W + 1) / W).astype(np.int64), 0, n)
+            for x in range(W):
+                a, b = int(edges[x]), int(max(edges[x] + 1, edges[x + 1]))
+                if a >= n:
+                    break
+                ymin, ymax = float(lo[a:b].min()), float(hi[a:b].max())
+                inside = xs <= x <= xe
+                c.create_line(x, mid - max(ymax, 0.004) * H / 2, x, mid - min(ymin, -0.004) * H / 2 + 1,
+                              fill=t["purple"] if inside else "#c9c2dd")
+        # The grab bar (drag it to move the box), and the edges.
+        gx0, gx1 = max(0, xs), min(W, xe)
+        if gx1 > gx0:
+            c.create_rectangle(gx0, R, gx1, R + self.GRAB, fill="#cfc3f3", outline="")
+            if gx1 - gx0 > 40:
+                cx = (gx0 + gx1) / 2
+                for dx in (-6, 0, 6):
+                    c.create_line(cx + dx, R + 4, cx + dx, R + self.GRAB - 4, fill=t["purple_dark"])
+        for x in (xs, xe):
+            if -2 <= x <= W + 2:
+                c.create_line(x, R, x, R + H, fill=t["purple_dark"], width=2)
+                c.create_rectangle(x - 4, R, x + 4, R + self.GRAB, fill=t["purple_dark"], outline="")
+        if self.playhead is not None:
+            px = self.x_of(self.playhead)
+            c.create_line(px, R, px, R + H, fill=t["error"], width=2)
+        # The time ruler.
+        span = v1 - v0
+        step = next((s for s in (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900,
+                                 1800, 3600) if span / s <= 10), 7200)
+        k = int(v0 // step)
+        while k * step <= v1:
+            tt = k * step
+            k += 1
+            if tt < v0:
+                continue
+            x = self.x_of(tt)
+            c.create_line(x, R - 6, x, R, fill=t["muted"])
+            c.create_text(x + 3, 2, text=fmt_time(tt, precise=step < 1), anchor="nw", fill=t["muted"],
+                          font=(fam, 8))
+        c.create_line(0, R, W, R, fill=t["border"])
+        if self.dur > 0:
+            self.sb.set(v0 / self.dur, v1 / self.dur)
+        try:
+            typing = self.top.focus_get() in self._entries
+        except (KeyError, tk.TclError):
+            typing = False
+        if not typing:
+            self.v_start.set(fmt_time(self.sel[0]))
+            self.v_end.set(fmt_time(self.sel[1]))
+        self.len_lbl.config(text=f"Selected: {fmt_time(self.sel[1] - self.sel[0])}")
+
+    # ---- mouse ----------------------------------------------------------- #
+    GRAB = 16  # the bar along the top of the box: drag it to move the box
+
+    def _edge_at(self, x, y):
+        xs, xe = self.x_of(self.sel[0]), self.x_of(self.sel[1])
+        if abs(x - xs) <= 6:
+            return "start"
+        if abs(x - xe) <= 6:
+            return "end"
+        if xs < x < xe and self.RULER <= y <= self.RULER + self.GRAB:
+            return "move"
+        return None  # anywhere else: draw a new box
+
+    def _hover(self, e):
+        edge = self._edge_at(e.x, e.y) if self.drag is None else None
+        self.c.config(cursor="sb_h_double_arrow" if edge in ("start", "end") else "fleur" if edge == "move"
+                      else "crosshair")
+
+    def _press(self, e):
+        self.c.focus_set()
+        edge = self._edge_at(e.x, e.y)
+        t0 = self.t_of(e.x)
+        if edge == "move":
+            self.drag = ("move", t0 - self.sel[0], self.sel[1] - self.sel[0])
+        elif edge:
+            self.drag = (edge,)
+        else:
+            self.drag = ("new", t0)
+            self.sel = [t0, t0]
+        self.redraw()
+
+    def _motion(self, e):
+        if not self.drag:
+            return
+        if e.x > self.W:  # dragging past the edge scrolls
+            self._pan((self.view[1] - self.view[0]) * 0.03)
+        elif e.x < 0:
+            self._pan(-(self.view[1] - self.view[0]) * 0.03)
+        t1 = self.t_of(e.x)
+        kind = self.drag[0]
+        if kind == "new":
+            a = self.drag[1]
+            self.sel = [min(a, t1), max(a, t1)]
+        elif kind == "start":
+            self.sel[0] = min(t1, self.sel[1] - 0.01)
+        elif kind == "end":
+            self.sel[1] = max(t1, self.sel[0] + 0.01)
+        else:
+            off, length = self.drag[1], self.drag[2]
+            start = min(max(0.0, t1 - off), self.dur - length)
+            self.sel = [start, start + length]
+        self.sel = [max(0.0, self.sel[0]), min(self.dur, self.sel[1])]
+        self.redraw()
+
+    def _zoom(self, x, k):
+        v0, v1 = self.view
+        at = self.t_of(x)
+        span = min(self.dur, max(self.min_span, (v1 - v0) * k))
+        start = min(max(0.0, at - span * x / self.W), self.dur - span)
+        self.view = [start, start + span]
+        self.redraw()
+
+    def _pan(self, d):
+        span = self.view[1] - self.view[0]
+        start = min(max(0.0, self.view[0] + d), self.dur - span)
+        self.view = [start, start + span]
+
+    def _xview(self, *args):
+        span = self.view[1] - self.view[0]
+        if args[0] == "moveto":
+            start = float(args[1]) * self.dur
+        else:
+            n, what = int(args[1]), args[2]
+            start = self.view[0] + n * (span * (0.9 if what == "pages" else 0.1))
+        start = min(max(0.0, start), self.dur - span)
+        self.view = [start, start + span]
+        self.redraw()
+
+    def _typed(self):
+        a, b = parse_time(self.v_start.get()), parse_time(self.v_end.get())
+        if a is not None and b is not None and b - a >= 0.01:
+            self.sel = [max(0.0, min(a, self.dur)), max(0.0, min(b, self.dur))]
+            if self.sel[1] - self.sel[0] < 0.01:
+                self.sel[1] = min(self.dur, self.sel[0] + 0.01)
+        self.c.focus_set()
+        self.redraw()
+
+    # ---- buttons -------------------------------------------------------- #
+    def show_all(self):
+        self.view = [0.0, self.dur]
+        self.redraw()
+
+    def zoom_selection(self):
+        a, b = self.sel
+        pad = max((b - a) * 0.1, 0.05)
+        span = min(self.dur, max(self.min_span, b - a + 2 * pad))
+        start = min(max(0.0, a - pad), self.dur - span)
+        self.view = [start, start + span]
+        self.redraw()
+
+    def select_all(self):
+        self.sel = [0.0, self.dur]
+        self.redraw()
+
+    def play(self):
+        self._play_from, self._play_to = self.sel
+        try:
+            self.app.engine.play("__trim__", f"{self.name} (trim preview)", self.path, self.volume,
+                                 trim=tuple(self.sel), preview=True)
+        except Exception as e:
+            messagebox.showerror("Can't play", str(e), parent=self.top)
+
+    def stop(self):
+        self.app.engine.stop("__trim__")
+
+    def close(self):
+        self.closed = True
+        self.stop()
+        self.top.destroy()
+
+    def done(self):
+        a, b = self.sel
+        whole = a <= 0.005 and b >= self.dur - 0.005
+        self.close()
+        self.on_done(None if whole else [round(a, 3), round(b, 3)])
 
 
 class CropDialog:
@@ -1818,16 +2370,20 @@ class SoundboardApp:
         af = tk.Frame(lc, bg="#ffffff")
         af.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         af.columnconfigure(0, weight=1)
-        self.audio_lbl = ttk.Label(af, text="", image=ui_icon(af, "file", 15), compound="left")
-        self.audio_lbl.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        fr = tk.Frame(af, bg="#ffffff")  # the file's name, and Trim on the right
+        fr.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 4))
+        self.audio_lbl = ttk.Label(fr, text="", image=ui_icon(af, "file", 15), compound="left")
+        self.audio_lbl.pack(side="left")
+        ttk.Button(fr, text="Trim…", command=self.trim_sound, image=ui_icon(af, "scissors", 15),
+                   compound="left").pack(side="right")
         ttk.Button(af, text="Browse…", command=self.browse_audio).grid(row=1, column=0, sticky="w")
         ttk.Button(af, text="Import…", command=self.import_into_sound, image=ui_icon(af, "download", 15),
                    compound="left").grid(row=1, column=1, sticky="w", padx=(6, 0))
         af.columnconfigure(0, weight=0)
-        af.columnconfigure(2, weight=1)
-        tk.Label(af, text="Import… loads a shared .sound file into this button.",
-                 bg="#ffffff", fg=t["muted"], font=(fam, 9), wraplength=290, justify="left").grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        af.columnconfigure(3, weight=1)
+        self.trim_lbl = tk.Label(af, text="", bg="#ffffff", fg=t["muted"], font=(fam, 9), wraplength=290,
+                                 justify="left", anchor="w")
+        self.trim_lbl.grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
         label(lc, "Hotkey", 4)
         hk = tk.Frame(lc, bg="#ffffff")
         hk.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 8))
@@ -1983,9 +2539,12 @@ class SoundboardApp:
         self.stop_e.bind("<KeyPress>", lambda e: self._tk_capture(e, "stop"))
         ttk.Button(sk, text="Clear", command=lambda: self._set_hotkey("stop", ""), style="LinkCard.TButton").pack(
             side="left", padx=(4, 0))
-        ttk.Button(dev, text="Refresh devices", command=self.refresh_devices,
-                   image=ui_icon(dev, "rotate-cw", 15), compound="left").grid(row=2, column=5, sticky="e",
-                                                                              pady=(8, 0))
+        db = tk.Frame(dev, bg="#ffffff")
+        db.grid(row=2, column=3, columnspan=3, sticky="e", pady=(8, 0))
+        ttk.Button(db, text="Refresh devices", command=self.refresh_devices,
+                   image=ui_icon(dev, "rotate-cw", 15), compound="left").pack(side="right")
+        PillButton(db, "Set up for Discord", lambda: DiscordSetup(self.root, self), icon="sparkles",
+                   on_card=True, height=40, padx=12, font=(fam, 10, "bold")).pack(side="right", padx=(0, 8))
         self.dev_status = tk.Label(dev, text="", bg="#ffffff", fg=t["muted"], font=(fam, 9), anchor="w",
                                    justify="left", wraplength=820)
         self.dev_status.grid(row=3, column=0, columnspan=6, sticky="ew", pady=(4, 0))
@@ -2120,7 +2679,7 @@ class SoundboardApp:
             return
         path = library_path(s["audio"])
         try:
-            self.engine.play(sid, s["name"], path, s.get("volume", 100) / 100)
+            self.engine.play(sid, s["name"], path, s.get("volume", 100) / 100, s.get("trim"))
         except FileNotFoundError:
             self.flash(f"The audio file for “{s['name']}” is missing. Choose it again in Configure.")
         except Exception as e:
@@ -2165,12 +2724,12 @@ class SoundboardApp:
         self._save_job = self.root.after(600, self.save)
 
     def warm_cache(self):
-        paths = [library_path(s["audio"]) for s in self.store.board()["sounds"]]
+        paths = [(library_path(s["audio"]), s.get("trim")) for s in self.store.board()["sounds"]]
 
         def work():
-            for p in paths:
+            for p, trim in paths:
                 try:
-                    self.engine.prepare(p)
+                    self.engine.prepare(p, trim)
                 except Exception:
                     pass
         threading.Thread(target=work, daemon=True).start()
@@ -2207,6 +2766,20 @@ class SoundboardApp:
             if s["monitor_on"] and mon_name and mon_name != main_name:
                 parts.append(f"and “{mon_name}”")
             msg.append(" ".join(parts) + (", with your microphone mixed into the first." if s["mic_on"] else "."))
+            # Settings that look wrong for a call (only the first, to keep it short).
+            two = s["monitor_on"] and mon_name and mon_name != main_name
+            warn = None
+            if s["mic_on"] and not is_cable(main_name):
+                warn = (f"Your microphone is mixed into “{main_name}”, which isn't a virtual cable, so Discord "
+                        "can't hear it. Click Set up for Discord.")
+            elif is_cable(main_name) and not two:
+                warn = "Sounds only go into the cable, so you won't hear them. Tick Also play on and pick your " \
+                       "headphones."
+            elif is_cable(main_name) and not s["mic_on"]:
+                warn = "If Discord's input is the cable, tick Mix in my microphone so people still hear you."
+            if warn:
+                msg = [warn]
+                problems = True
         if self.hotkeys.error:
             msg.append(f"Global hotkeys aren't working: {self.hotkeys.error}")
         elif sys.platform == "darwin":
@@ -2428,7 +3001,18 @@ class SoundboardApp:
             return
         audio = e.get("audio", "")
         shown = audio.split("-", 1)[1] if "-" in audio else audio
-        self.audio_lbl.config(text=(shown[:17] + "…") if len(shown) > 18 else (shown or "(none)"))
+        self.audio_lbl.config(text=(shown[:16] + "…") if len(shown) > 17 else (shown or "(none)"))
+        dur = audio_length(library_path(audio)) if audio else 0
+        trim = e.get("trim")
+        if trim:
+            self.trim_lbl.config(text=f"Plays {fmt_time(trim[0])} to {fmt_time(trim[1])} "
+                                      f"({fmt_time(trim[1] - trim[0])} of {fmt_time(dur, precise=False)}).",
+                                 fg=UI["muted"])
+        elif dur > 60:
+            self.trim_lbl.config(text=f"This clip is {fmt_time(dur, precise=False)} long. Trim… plays just "
+                                      "part of it.", fg=UI["error"])
+        else:
+            self.trim_lbl.config(text=f"Plays the whole clip ({fmt_time(dur)}).", fg=UI["muted"])
         has_icon = e["icon"]["kind"] != "none"
         self.small_rb.state(["!disabled"] if has_icon else ["disabled"])
         if e["icon"]["kind"] == "sticker":
@@ -2555,8 +3139,25 @@ class SoundboardApp:
             messagebox.showerror("Can't use this file", f"{os.path.basename(path)}:\n{err}")
             return
         self.edit["audio"] = library_copy(path)
+        self.edit["trim"] = None
         self.dirty = True
         self._update_editor()
+
+    def trim_sound(self):
+        if not self.edit:
+            return
+        path = library_path(self.edit.get("audio", ""))
+        if not os.path.exists(path):
+            messagebox.showerror("No audio", "This sound's audio file is missing. Choose one with Browse….")
+            return
+
+        def done(trim):
+            if trim != self.edit.get("trim"):
+                self.edit["trim"] = trim
+                self.dirty = True
+                self._update_editor()
+        TrimDialog(self.root, self, path, self.edit.get("trim"), self.edit["name"] or "Sound",
+                   self.edit.get("volume", 100) / 100, done)
 
     def import_into_sound(self):
         """Fill the sound being edited from a .sound file (keeps its hotkey and volume)."""
@@ -2571,6 +3172,7 @@ class SoundboardApp:
             messagebox.showerror("Import failed", f"{os.path.basename(path)}:\n{e}")
             return
         self.edit.update(f)
+        self.edit["trim"] = None  # a .sound holds just the part that plays
         self._loading = True
         self.v_name.set(f["name"])
         self.v_size.set(f["size"])
@@ -2623,12 +3225,13 @@ class SoundboardApp:
         self.load_edit(s["id"])
         self.edit_status.config(text="Saved." + (" It moved to the next free spot to fit." if moved else ""),
                                 fg=UI["muted"])
-        threading.Thread(target=lambda: self._prepare_quiet(library_path(s["audio"])), daemon=True).start()
+        threading.Thread(target=lambda: self._prepare_quiet(library_path(s["audio"]), s.get("trim")),
+                         daemon=True).start()
         return True
 
-    def _prepare_quiet(self, path):
+    def _prepare_quiet(self, path, trim=None):
         try:
-            self.engine.prepare(path)
+            self.engine.prepare(path, trim)
         except Exception:
             pass
 
@@ -3904,6 +4507,8 @@ EXTRA_ICONS = {
     "sticker@18": "iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAADF0lEQVR42o2UT2hcVRTGf+fe9yaTP00TtdJa0ZrUQqtGXJSZKdqh4KLFRXHxNt0I1mamFWqroJviYyyCopBKEUMbFLpwkYhrV8agaCW4VEgbk3HE0D9CSpKZzMx77x4X+TeBCDlw4d57zvnudz++e6ElgkAt24wgGN1UK2sTRUUQPfviX30G/+U4SR5TYkHdSo0YtXgqYu866t8P/9w3BSogCuABEoYqUhJXyM5eTkn3JQAnVRQDYjad69k0Rroo5spDw7/wThiqKZVQCQK1Y2OSnMnevtzT3ndpsT437Kh+RpN/26xpVr1eBeiM58Vph692udeJf25H+vGLD2rlq9d/3X9+XZJCZnbfWy/NazE3e227Gg3mZj++mK9qMTf9LIABUONeAdSgH4ahmjA/7m20qKyMVZEZtUGglmbjkyipORV7ch0IpDdyy7Js07VSSdwPwGC2/OmZzPSJFTFFB3MzR4tHKlc4FNixMUkaXW1LUbyY4HRPC5BZECy+ND2AgX/2WkRPGmOe2SCmB1Be3cXvKYC2pX0JkKylvdUiA+DVVQGuTh9oMM3TrZpcu9k/Aoysrfd0oXcaG3mzpdkYtaee+7EXIJ8f9/Krmr32/HgP6JY9K5siDqApkQfQmz383sM7D82czkwdnJg4Fk9MHItPZ6YOdncPzBRz5XcBypS9ViBvBSfZoSSo2AjAJe6bxEZvtvs9fwzmZr4GSNnOU+qiuTh23wI81LBSI7abGInKomfSKpryg0DtyGT/rVqjknXO3TDiHzfiH3fO3VhqVLIjk/23gkBt3dO0Zzutwv11Wueylf0Xji5oIVce2q4hC9mZ99/O17WYm30BYOOJZG4P9XQ8dWGhMfdREtc/T7U3H1TpjGuPTkYAHfcO+4/Mp+2iP99tUl1vdLbt/mCh/vdX12/2vx4Eo1ZAJQyRUgktHKlc6fB3nY+SRZpxNRaIN9EQsZ5p99u8nVSje1/u9p8oMIErtVp/7Us4m/lzwJiOEwnNvQ4nBlBVURE1GBXx72Ki77746cnf/vfeYbi1R7asRU0rkf8AxIdOgME3aEoAAAAASUVORK5CYII=",
     "sticker-dark@15": "iVBORw0KGgoAAAANSUhEUgAAAA8AAAAPCAYAAAA71pVKAAACEUlEQVR42pWTz0tUURTHP+feN01SEFjgzIS0rI3kzLiNiFYRuJF26ZuxEoKiP+Hx/oKCdiXlaLYol9laWwXlM1dthBK00WgRJDm/7j0tfDPTRqjv5h4438P58f1e6CEy/BNUulHQL4x9sTA1LmpveXwhzadEUYN8R1wt+SavUr5KrzAXPgps9kHHN9+CflWlhYiiKiJkFBkOzLFx79vPk/rcNERGAMpD4XUTZN+0Os0rG3u1laMGLuYmx6w9/sH71s2kXls0AE6433aN5Y292kqZmUyXfJko6MZlZjLruwsfO77xwqveAzDpSqcQ2YHInDzXtKP5cKGcr5RWiTsjhenzxVz40g5mByAyRuwmcKZXLMg+yADEvukGBXQfRxsgMC0Hsu+0KRB79d4J4nrXVjACDuD99sMD4G537NXteBOY6W8u2lUh7YxX9RmA0dzUtWKh+hRglbgDUCpUHxdz4UTayB4+/c4nBBoQGStbe4pUSvnqRa9uWYy9KthLinsNkRH5YlWx/YOp/lY4DbFfq88lLT0YEWHHSjApKr+cNEbXd+ffQexVdRiRnz0HFXPhhLXZJe+bY0m9tnaUzuV8eAHJfHbauvOpPj/bc1gpX3lmTKbqXHsR3BZq2ireiRqrRgPBnDViK6puKanP3eg6TCCS1KKTYsxtVT+EIoefQBRBRcwP1M8n9dqTvuf/0oD/xB9wo+f2EGTrYAAAAABJRU5ErkJggg==",
     "sticker-dark@18": "iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAAC40lEQVR42o2UT4gcRRTGf6+qe2ays3GzkF17EiFBopBIkmmImJNz8ZDgYfHQl+DO+CcYVAiKEC/BYQyCorCRIAgGNbvqZcWzJ3HuRpcogiEkenD/GME/Mywz3V31PGRnbVYi+05VvPdVve979RUUIiGxbDO21sqWtR6bfvp+b3lM8XtApVCjIGrErKWkX32//OlPI8wILG3a0qHj67XWhdCUzwM4zUAVLd4mgpEAwZD5wdzSypVXoC3QUUlI7CKLrl6bvVCxE+dT139f0Hch/d0OTRpIWQFyHYpWTJgbnRRnXwjt+MvDvHdpaXX+bEJiBeDova39paB8K3fpB9+tfvzcdjSqR823SkH1nM96h79Z++QHA2Atj9/hat6AtmnQDrZoV9AysQmJtVJ52/nMO7EzAAZAvU46zUXRdeh4+Jq41nynHjVPboipcdR8NI5aFw8dwi6y6MZLw37uU6dobfMgI/K3INg8DQB+PXDEqsoMhodGfajwIMgT3KYE0N9ddgJulA825moEMBIowI0bl4bAA0VNllbmLwOXR/vxqzX9K7q1mTd3eW728MSpSYAGjaBBIwA4OjGz624Ys6GmBxiU8gCgXqu+Wq5Wb8bR7MEu3bxLN4+j2YNhdepmvdY6B8C+n4sDuUPNKztFlLGskgF4cZ+r2heNKf0YR83PAIwJT6nqshf/BcDQrYuyw0qxIxV6RqxqOAgTEntteeH6QPrHVXUeMScQc0JV5wfSP35teeF6QmKD3u5KYEIL3N5sK5569sDDe89oHDXntmvaetR67ZH7ntdje2ZjgH8tEj05Vwl2vTTM+2/mNnvPpemfU2Nj+fQv6xnAb/vGwj8GzoZO73FBcLocVF8f5r2PllYXnhlZREbGi6OnLoZ2x1mnKU6zHCUvWB8EayUMrSmRu/UPd67sP9MFDx39zzcSTzePGBucdOL34kd5FRDFiIqXNRH/5bcrV67+D/O2YdvRNkUP/gP8bSS9Qws8SwAAAABJRU5ErkJggg==",
+    "scissors-white@15": "iVBORw0KGgoAAAANSUhEUgAAAA8AAAAPCAYAAAA71pVKAAABIklEQVR42qWTPUqDQRCG393kAw8REY0gSAh4BMFeS0HrdNqIfazi3wVEbPw5gGcI2NgKKWJrPEMaHwvfNeOHsXFgWWZ2npnZndkEaI4kSfxlyzZkSfuShpKuJLXtlAKYbetKqiRJgIBdvuQReAfGQAUkr8p+R/bbAL7hZ4MCFu2wY33B+6HtD7blAt8446qjT4EVnwk4MHgXbEkuaxl4AT6YybnPjq3fG8q2q8Bl3wLWgQsDT95v62C8cw7llFXAE+vNCNYzN4BNYA04M9j33XvzMidgCRjxUy7t1LM+qFdQSrgGJkDHDzR1wJJp4ACn4X3Sb31u2XE7ZJJB/JjN2Oe90Mc34DVMWA4BShe68c4Nj+jQA9MO5SmMqQxWgNJ/ftUnxOhgfWSMXDgAAAAASUVORK5CYII=",
+    "scissors-white@18": "iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAABSklEQVR42o2UO04DMRCGf3sXiUOkoaOmAwQFLRUSJ6DnISQqlICQkAivIi0SEKXlHNBxAk4ChI9mHE2861VGsry74/k8M/vbAVDBgqSiU1Jl81SSaguQBW1JWpH0Jem9AxgTYGZABASMmbcJUDt/GrXNZ8DInmNy7ljwAFgFLux93/xVBjk0/1sOGgLf2c5Ty1LAkoMcuYxTRSEF7ZnzHOhZRr/Ari1c7oIAsx7VwDNNu3UZHpcgCeTHJnACbFi5AFeuZ+M2SA7K/44MkuzRNT7ka6NXQovo/mx+knTaudboaYdt4CAr7cF8feCulJUv6bWl2dfmC8C9fbtxmmo0Owmyb4IcAD/W/GA6kkE8rMpBJUFOnCCrAqxTkJctRyQ4dSfY3FlLgnxZ4NAGl9nIn7WQ3UfrktYkfUr66LhGGt88KDrdLGLRYEjSP7BEHabPYnvKAAAAAElFTkSuQmCC",
     "pencil-white@15": "iVBORw0KGgoAAAANSUhEUgAAAA8AAAAPCAYAAAA71pVKAAABAElEQVR42pWTO0oEQRCGv5mdQIzMFvQCu6u5mbcwELyF4BEEQfAaBt7AaL2Bm6jgAwTBHZ1cYfUzqVkbHz1uQdOv+rr+7qouVDqsB7wDJbALFMAJ8Iaaa1X0Q3Xil43V5SoTsQJmwAA4A4xxHxgD22UHOAzHNeAOuAamc6+M1IH6oj6q+yH3POb36lIOrNWpuh5re3HAszpSyYF166RuqLfqQ+yj9lqwlwFHMW/i1eeBUMt/gHUSsVUIaqH21adFwPTOx+pr8jidYCq7UY8WAVVKYBNYARrgALiIatoCrpKC+WnqTuRvpt6oh+rqtyz82irgFPgALoFJcm4Zv+lP+wQ3dgQs8b+wWgAAAABJRU5ErkJggg==",
     "pencil-white@18": "iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAABQ0lEQVR42pWUsUpDMRiFT3qrODl3E8TJim/gM/gEjo4tXZwchA7SooKD6ObSTg6+QUdHERxFUfABFLHQQfq5nGC43NY0EPLn5M/H+XNvEgBltuA+lbQlaU3So6R3SUFATg9A4fiYvzYGdgHlQuqOTwy4AnaAe+ATWF0E0k8gcX3P2mZuOdHJN/AMNK3fAFOgsYiTrgFfwKudRX3mGS15PHJyL1nb8CEDnFkrqiDRScvJF54ve+xav4wQIMyCtJ08dJnRYc/6aQopl1aGDDyveTy33k/yQ9yvhDwPMrR+WHaSgiKkMwMysN6qclJ2tO7kWyeVIe3ka4aqLx3/mX1v2E7clCH1ebcgBiPgzXEDuK4oR/+BGsAEeALukpvdyYUAqktakTT2+/Ih6UDSSNKDpELST9Zj5YetKWki6SVZq/kRy2q/7ZR5NITSGToAAAAASUVORK5CYII=",
     "pencil-dark@15": "iVBORw0KGgoAAAANSUhEUgAAAA8AAAAPCAYAAAA71pVKAAABAUlEQVR42o3TzypFURTH8c895zyAmWRiiBjIwAA3BpQHMBNl6AWYKyMp5SHc8gZK915PQPk3kVJKMadc12TtOt1y7tmj1Wp99++31tq7MTe2Y8jJ0UOGLTRwju9iCFjgB1NoYTbyu9goaoCTuEQ/4lF0sJnVUOxgHM94wnsqyoYoXke8jya6uMILWkUF2I1BreMu4mN8YA1fWQUIqwHOYA+vWMY98qK0jkFwJYqmw2qOJTwmoSL67lWA7cgtlsE0sH6Mv10BNgfB1GcfBxjBfF0wKWfYxlkMpxaY4IVQ/cQRbsJNJZhsT8Qlh7H8E5zirbSFf5/hBX7xgNsBV72qX/MHg75N//PT2R4AAAAASUVORK5CYII=",

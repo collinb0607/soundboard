@@ -27,6 +27,10 @@ On an Intel Mac, or any other system, run it from source with Python (below).
 - **Buttons your way.** Each sound has a name, a color (12 presets or any color you pick), a volume
   and a hotkey. Give it one of the 180 built-in stickers, or your own picture (you crop it square).
   A button is either **wide** (icon and name) or **square** (just the icon).
+- **Trim long clips.** **Trim…** shows the sound's waveform: drag across it to draw a box around
+  the part that should play, drag the box's edges to adjust it, or the bar along its top to move it.
+  Zoom in with the mouse wheel, and preview the selection in your headphones. Even an hour-long
+  recording is fine: only the part you chose is loaded when it plays.
 - **Arrange freely.** Click **Arrange** and drag buttons to any spot on the grid, gaps and all.
   Drop one on another to swap them. Click **Done** when you're finished.
 - **Hotkeys everywhere.** Any key or combination (F1, Ctrl+Shift+A, Num 5...) plays its sound
@@ -40,7 +44,7 @@ On an Intel Mac, or any other system, run it from source with Python (below).
 ## Sharing
 | File | What's in it |
 |---|---|
-| `Name.sound` | One sound: its audio, name, button color and shape, and its sticker or picture. Hotkey and volume stay with you. **Import sounds** adds them to the open board; **Import…** next to the audio file loads one into the sound you're editing. |
+| `Name.sound` | One sound: its audio (only the trimmed part, if you trimmed it), name, button color and shape, and its sticker or picture. Hotkey and volume stay with you. **Import sounds** adds them to the open board; **Import…** next to the audio file loads one into the sound you're editing. |
 | `Name.soundboard` | A whole board: its name, its layout (where each button sits on the grid), and every button as a `.sound` file. **Import board** adds it as a new board. |
 
 You can also drag sound files, `.sound` or `.soundboard` files onto the window.
@@ -49,6 +53,12 @@ You can also drag sound files, `.sound` or `.soundboard` files onto the window.
 Apps hear the soundboard through a **virtual audio cable**, a free driver that acts like a pair of
 speakers and a microphone wired together. On Windows, install
 [VB-CABLE](https://vb-audio.com/Cable/). On a Mac, [BlackHole](https://existential.audio/blackhole/).
+
+The easy way: in **Configure**, click **Set up for Discord**. It checks for the cable (with a
+download link if it's missing), sets the soundboard up with one click, and lists what to set in
+Discord. The app also warns you when the settings look wrong for a call.
+
+Or by hand:
 
 1. In **Configure**, set **Output device** to the cable's input (VB-CABLE: *CABLE Input*).
 2. Tick **Also play on** and pick your headphones or speakers, so you hear the sounds too.

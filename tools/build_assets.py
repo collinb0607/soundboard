@@ -161,7 +161,7 @@ EXTRA_ICONS = {  # name: color variants
 
 
 # Colors of icons the shared block has only in purple.
-RECOLOR = {"pencil": ["white", "dark"], "volume-2": ["dark", "grey", "white"], "rotate-cw": ["dark"]}
+RECOLOR = {"scissors": ["white"], "pencil": ["white", "dark"], "volume-2": ["dark", "grey", "white"], "rotate-cw": ["dark"]}
 
 
 def recolor(data, color):
