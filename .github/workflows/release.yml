@@ -20,9 +20,9 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            asset: Soundboard-Windows.exe
+            asset: CBs-Soundboard-Windows.exe
           - os: macos-latest  # Apple Silicon (M1 and newer)
-            asset: Soundboard-macOS.zip
+            asset: CBs-Soundboard-macOS.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -37,8 +37,8 @@ jobs:
         # One file, no console window. The stickers are bundled next to the app's code;
         # the sound libraries (PortAudio, libsndfile) come from their packages' hooks.
         run: |
-          pyinstaller --noconfirm --icon assets/icon.ico --onefile --windowed --name Soundboard --add-data "stickers:stickers" --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 soundboard.py
-          Move-Item dist/Soundboard.exe ${{ matrix.asset }}
+          pyinstaller --noconfirm --icon assets/icon.ico --onefile --windowed --name CBs-Soundboard --add-data "stickers:stickers" --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 soundboard.py
+          Move-Item dist/CBs-Soundboard.exe ${{ matrix.asset }}
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
@@ -46,10 +46,10 @@ jobs:
         # microphone if it says why, so that's added to its Info.plist (then it's re-signed).
         # ditto keeps the permissions and code signature that a plain zip would lose.
         run: |
-          pyinstaller --noconfirm --icon assets/icon.icns --windowed --name "Soundboard" --osx-bundle-identifier com.offlinetoolkit.soundboard --add-data "stickers:stickers" --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin soundboard.py
-          plutil -insert NSMicrophoneUsageDescription -string "Soundboard mixes your microphone into its output when you turn that on." "dist/Soundboard.app/Contents/Info.plist"
-          codesign --force --deep --sign - "dist/Soundboard.app"
-          ditto -c -k --keepParent "dist/Soundboard.app" ${{ matrix.asset }}
+          pyinstaller --noconfirm --icon assets/icon.icns --windowed --name "CB's Soundboard" --osx-bundle-identifier com.offlinetoolkit.soundboard --add-data "stickers:stickers" --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin soundboard.py
+          plutil -insert NSMicrophoneUsageDescription -string "CB's Soundboard mixes your microphone into its output when you turn that on." "dist/CB's Soundboard.app/Contents/Info.plist"
+          codesign --force --deep --sign - "dist/CB's Soundboard.app"
+          ditto -c -k --keepParent "dist/CB's Soundboard.app" ${{ matrix.asset }}
 
       # Smoke test: the app must start and still be running after 20 s
       # (a missing module or library makes a frozen app quit at once).
@@ -66,13 +66,13 @@ jobs:
       - name: Smoke test (macOS)
         if: runner.os == 'macOS'
         run: |
-          "dist/Soundboard.app/Contents/MacOS/Soundboard" &
+          "dist/CB's Soundboard.app/Contents/MacOS/CB's Soundboard" &
           pid=$!
           sleep 20
           kill -0 $pid || { echo "App exited early"; exit 1; }
           kill $pid
           # Loads sound, MP3 reading, hotkeys, images, stickers and drag and drop inside the packaged app.
-          "dist/Soundboard.app/Contents/MacOS/Soundboard" --self-test || { echo "Self-test failed with code $?"; exit 1; }
+          "dist/CB's Soundboard.app/Contents/MacOS/CB's Soundboard" --self-test || { echo "Self-test failed with code $?"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -91,5 +91,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release create "${{ github.ref_name }}" Soundboard-Windows.exe Soundboard-macOS.zip
-          --repo "${{ github.repository }}" --title "Soundboard ${{ github.ref_name }}" --generate-notes
+          gh release create "${{ github.ref_name }}" CBs-Soundboard-Windows.exe CBs-Soundboard-macOS.zip
+          --repo "${{ github.repository }}" --title "CB's Soundboard ${{ github.ref_name }}" --generate-notes

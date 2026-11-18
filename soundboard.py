@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Soundboard - a cross-platform (Windows / macOS) soundboard: boards of sound buttons you
+CB's Soundboard - a cross-platform (Windows / macOS) soundboard: boards of sound buttons you
 play with a click or a global hotkey, into a chosen output device (e.g. a virtual cable
 for Discord or OBS) and your own speakers or headphones at the same time, with your
 microphone optionally mixed in.
@@ -35,13 +35,14 @@ from collections import deque
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-APP_NAME = "Soundboard"
+APP_NAME = "CB's Soundboard"
+DATA_FOLDER = "CBSoundboard"  # the boards and the library: %APPDATA%\CBSoundboard on Windows
 AUDIO_EXTS = (".wav", ".mp3", ".ogg", ".flac")
 AUDIO_TYPES = [("Sound files", "*.wav *.mp3 *.ogg *.flac"), ("All files", "*.*")]
 IMAGE_TYPES = [("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"), ("All files", "*.*")]
 SOUND_EXT, BOARD_EXT = ".sound", ".soundboard"
-SOUND_TYPES = [("Soundboard sound", "*" + SOUND_EXT)]
-BOARD_TYPES = [("Soundboard board", "*" + BOARD_EXT)]
+SOUND_TYPES = [("CB's Soundboard sound", "*" + SOUND_EXT)]
+BOARD_TYPES = [("CB's Soundboard board", "*" + BOARD_EXT)]
 COLUMNS = 8  # grid cells across: four large (2 x 1) buttons, or eight small (1 x 1) ones
 PRESET_COLORS = ["#f25757", "#f5a524", "#43b649", "#14b8a6", "#22b5e8", "#2f80ed",
                   "#7c3aed", "#c026d3", "#ec4899", "#a06cf0", "#6b7bf0", "#4f5bd5"]
@@ -59,7 +60,7 @@ def data_dir():
         base = os.path.expanduser("~/Library/Application Support")
     else:
         base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(base, APP_NAME)
+    return os.path.join(base, DATA_FOLDER)
 
 
 def resource(*parts):
@@ -915,48 +916,64 @@ def _unpack_sound(z, e):
             "audio": audio}
 
 
-def export_sound(s, path):
-    with zipfile.ZipFile(path + ".part", "w", zipfile.ZIP_DEFLATED) as z:
+def _sound_bytes(s):
+    """A whole .sound file (a zip: sound.json, the audio, and a custom image if it has one)."""
+    import io
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         entry = _pack_sound(z, s)
         z.writestr("sound.json", json.dumps({"format": "soundboard-sound", "version": 1, **entry}, indent=1))
+    return buf.getvalue()
+
+
+def export_sound(s, path):
+    with open(path + ".part", "wb") as f:
+        f.write(_sound_bytes(s))
     os.replace(path + ".part", path)
 
 
-def import_sound(path):
-    with zipfile.ZipFile(path) as z:
+def import_sound(src):
+    """A sound's fields from a .sound file (a path, or a file object), its files copied into the library."""
+    with zipfile.ZipFile(src) as z:
         meta = json.loads(z.read("sound.json"))
         if meta.get("format") != "soundboard-sound":
-            raise ValueError("This isn't a Soundboard sound file.")
+            raise ValueError("This isn't a CB's Soundboard sound file.")
         return _unpack_sound(z, meta)
 
 
 def export_board(board, path):
-    with zipfile.ZipFile(path + ".part", "w", zipfile.ZIP_DEFLATED) as z:
-        sounds = []
-        for i, s in enumerate(board["sounds"]):
-            e = _pack_sound(z, s, f"sounds/{i + 1}/")
-            e.update(x=s["x"], y=s["y"], hotkey=s.get("hotkey", ""), volume=s.get("volume", 100))
-            sounds.append(e)
-        z.writestr("board.json", json.dumps({"format": "soundboard-board", "version": 1, "name": board["name"],
-                                             "sounds": sounds}, indent=1))
+    """A .soundboard file: board.json (the board's name and layout) and every button as its
+    own .sound file in sounds/."""
+    with zipfile.ZipFile(path + ".part", "w", zipfile.ZIP_STORED) as z:  # (the .sounds are zipped already)
+        layout = []
+        for i, s in enumerate(board["sounds"], 1):
+            name = f"sounds/{i:02d} {safe_name(s['name'])}{SOUND_EXT}"
+            z.writestr(name, _sound_bytes(s))
+            layout.append({"sound": name, "x": s["x"], "y": s["y"]})
+        z.writestr("board.json", json.dumps({"format": "soundboard-board", "version": 2, "name": board["name"],
+                                             "layout": layout}, indent=1))
     os.replace(path + ".part", path)
 
 
 def import_board(path):
+    import io
     with zipfile.ZipFile(path) as z:
         meta = json.loads(z.read("board.json"))
         if meta.get("format") != "soundboard-board":
-            raise ValueError("This isn't a Soundboard board file.")
+            raise ValueError("This isn't a CB's Soundboard board file.")
+        names = set(z.namelist())
         sounds, skipped = [], []
-        for e in meta.get("sounds", []):
+        for e in meta.get("layout", []):
+            label = os.path.splitext(os.path.basename(str(e.get("sound", "?"))))[0]
             try:
-                f = _unpack_sound(z, e)
+                if e.get("sound") not in names:
+                    raise ValueError("missing from the board file")
+                f = import_sound(io.BytesIO(z.read(e["sound"])))
             except Exception as err:
-                skipped.append(f"{e.get('name', '?')}: {err}")
+                skipped.append(f"{label}: {err}")
                 continue
             s = new_sound(f["name"], f["audio"], f["color"])
-            s.update(icon=f["icon"], size=f["size"], hotkey=str(e.get("hotkey") or ""),
-                     volume=max(0, min(100, int(e.get("volume", 100) or 0))))
+            s.update(icon=f["icon"], size=f["size"])
             x, y = int(e.get("x", 0) or 0), int(e.get("y", 0) or 0)
             if fits(occupied(sounds), x, y, s["size"]):
                 s["x"], s["y"] = x, y
@@ -2193,7 +2210,7 @@ class SoundboardApp:
         if self.hotkeys.error:
             msg.append(f"Global hotkeys aren't working: {self.hotkeys.error}")
         elif sys.platform == "darwin":
-            msg.append("Hotkeys not working? Allow Soundboard in System Settings → Privacy & Security → "
+            msg.append("Hotkeys not working? Allow CB's Soundboard in System Settings → Privacy & Security → "
                        "Accessibility and Input Monitoring.")
         self.dev_status.config(text="\n".join(msg), fg=UI["error"] if problems else UI["muted"])
         self.warm_cache()
@@ -2938,11 +2955,11 @@ def install_requirements(pkgs):
 def offer_install(root, missing):
     """Before the app starts: offer to install what's missing, then restart. False = quit."""
     if getattr(sys, "frozen", False):
-        messagebox.showerror("Incomplete app", "This copy of Soundboard is missing parts "
+        messagebox.showerror("Incomplete app", "This copy of CB's Soundboard is missing parts "
                              f"({', '.join(missing)}). Please download it again.")
         return False
-    if not messagebox.askyesno("Install what Soundboard needs?",
-                               "Soundboard needs a few free Python packages to play sound and use hotkeys:\n\n"
+    if not messagebox.askyesno("Install what CB's Soundboard needs?",
+                               "CB's Soundboard needs a few free Python packages to play sound and use hotkeys:\n\n"
                                f"{', '.join(missing)}\n\nInstall them now? (about 40 MB download)\n\n"
                                f"This runs pip for the Python running this app:\n{sys.executable}"):
         return False

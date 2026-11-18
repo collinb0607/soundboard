@@ -1,8 +1,8 @@
-# Soundboard
+# CB's Soundboard
 
 **Free, offline soundboard with global hotkeys. No ads, no account, no subscription.**
 
-![Soundboard: a board of sound buttons with stickers and hotkeys, two of them playing](docs/soundboard.png)
+![CB's Soundboard: a board of sound buttons with stickers and hotkeys, two of them playing](docs/soundboard.png)
 
 Make boards of sound buttons and play them with a click or a hotkey, even while you're in a game or
 Discord. Sounds go into the device you choose (for example a virtual cable that Discord or OBS
@@ -15,8 +15,8 @@ Nothing else to install.
 
 | Your computer | Download | First launch |
 |---|---|---|
-| Windows 10/11 | `Soundboard-Windows.exe` | Windows may show "Windows protected your PC" because the app isn't signed. Click **More info**, then **Run anyway**. The first start takes a few seconds. |
-| Mac with Apple Silicon (M1 or newer) | `Soundboard-macOS.zip` | Unzip, then open **Soundboard**. macOS blocks it the first time because the app isn't notarized: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. For hotkeys, allow Soundboard under **Accessibility** and **Input Monitoring** there too. |
+| Windows 10/11 | `CBs-Soundboard-Windows.exe` | Windows may show "Windows protected your PC" because the app isn't signed. Click **More info**, then **Run anyway**. The first start takes a few seconds. |
+| Mac with Apple Silicon (M1 or newer) | `CBs-Soundboard-macOS.zip` | Unzip, then open **CB's Soundboard**. macOS blocks it the first time because the app isn't notarized: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. For hotkeys, allow CB's Soundboard under **Accessibility** and **Input Monitoring** there too. |
 
 On an Intel Mac, or any other system, run it from source with Python (below).
 
@@ -40,8 +40,8 @@ On an Intel Mac, or any other system, run it from source with Python (below).
 ## Sharing
 | File | What's in it |
 |---|---|
-| `Name.sound` | One sound: its audio, name, color, button shape and sticker or picture. Hotkey and volume stay with you. **Import sounds** adds them to the open board; **Import…** next to the audio file loads one into the sound you're editing. |
-| `Name.soundboard` | A whole board: every sound, where it sits on the grid, and its hotkey and volume. **Import board** adds it as a new board. |
+| `Name.sound` | One sound: its audio, name, button color and shape, and its sticker or picture. Hotkey and volume stay with you. **Import sounds** adds them to the open board; **Import…** next to the audio file loads one into the sound you're editing. |
+| `Name.soundboard` | A whole board: its name, its layout (where each button sits on the grid), and every button as a `.sound` file. **Import board** adds it as a new board. |
 
 You can also drag sound files, `.sound` or `.soundboard` files onto the window.
 
@@ -75,15 +75,15 @@ python3 soundboard.py       # macOS
 ```
 
 ## Troubleshooting
-- **Hotkeys do nothing on a Mac:** allow Soundboard (or Terminal / Python, when running from
+- **Hotkeys do nothing on a Mac:** allow CB's Soundboard (or Terminal / Python, when running from
   source) in **System Settings → Privacy & Security → Accessibility** and **Input Monitoring**,
   then restart the app.
 - **A hotkey doesn't play while typing in the app:** that's on purpose. Hotkeys are ignored while
   you're typing in one of the app's text boxes.
 - **Discord doesn't hear the sounds:** check that Discord's input device is the cable's *output*,
   and the soundboard's output device is the cable's *input*.
-- **Your boards** are kept in `%APPDATA%\Soundboard` on Windows and
-  `~/Library/Application Support/Soundboard` on a Mac.
+- **Your boards** and the app's copies of your sounds and pictures are kept in
+  `%APPDATA%\CBSoundboard` on Windows and `~/Library/Application Support/CBSoundboard` on a Mac.
 - **Something fails with no message:** errors are also written to `soundboard_errors.log` in your
   temp folder. On Windows, paste `%TEMP%\soundboard_errors.log` into File Explorer's address bar.
   On Mac, run `open $TMPDIR/soundboard_errors.log`.
