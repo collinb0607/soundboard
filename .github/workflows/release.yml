@@ -1,0 +1,95 @@
+# Builds the downloadable apps and attaches them to a GitHub release.
+# Runs when a version tag is pushed:  git tag v1.0.1 && git push origin v1.0.1
+#
+# Each OS builds on its own runner because PyInstaller can't cross-compile:
+# a Mac app has to be built on a Mac.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:  # manual run from the Actions tab: builds only, no release
+
+permissions:
+  contents: write  # needed to create the release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: Soundboard-Windows.exe
+          - os: macos-latest  # Apple Silicon (M1 and newer)
+            asset: Soundboard-macOS.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned to the versions the Windows build was tested with.
+      - run: python -m pip install pyinstaller==6.22.3 numpy==2.5.5 sounddevice==0.5.6 soundfile==0.14.0 pillow==13.0.0 pynput==1.8.2 tkinterdnd2==0.7.0
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        # One file, no console window. The stickers are bundled next to the app's code;
+        # the sound libraries (PortAudio, libsndfile) come from their packages' hooks.
+        run: |
+          pyinstaller --noconfirm --icon assets/icon.ico --onefile --windowed --name Soundboard --add-data "stickers:stickers" --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 soundboard.py
+          Move-Item dist/Soundboard.exe ${{ matrix.asset }}
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        # A .app bundle (one-dir: macOS apps are folders). macOS only lets an app use the
+        # microphone if it says why, so that's added to its Info.plist (then it's re-signed).
+        # ditto keeps the permissions and code signature that a plain zip would lose.
+        run: |
+          pyinstaller --noconfirm --icon assets/icon.icns --windowed --name "Soundboard" --osx-bundle-identifier com.offlinetoolkit.soundboard --add-data "stickers:stickers" --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin soundboard.py
+          plutil -insert NSMicrophoneUsageDescription -string "Soundboard mixes your microphone into its output when you turn that on." "dist/Soundboard.app/Contents/Info.plist"
+          codesign --force --deep --sign - "dist/Soundboard.app"
+          ditto -c -k --keepParent "dist/Soundboard.app" ${{ matrix.asset }}
+
+      # Smoke test: the app must start and still be running after 20 s
+      # (a missing module or library makes a frozen app quit at once).
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $p = Start-Process ./${{ matrix.asset }} -PassThru
+          Start-Sleep 20
+          if ($p.HasExited) { throw "App exited early with code $($p.ExitCode)" }
+          Stop-Process -Id $p.Id -Force
+          # Loads sound, MP3 reading, hotkeys, images, stickers and drag and drop inside the packaged app.
+          $t = Start-Process ./${{ matrix.asset }} -ArgumentList "--self-test" -PassThru -Wait
+          if ($t.ExitCode -ne 0) { throw "Self-test failed with code $($t.ExitCode)" }
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          "dist/Soundboard.app/Contents/MacOS/Soundboard" &
+          pid=$!
+          sleep 20
+          kill -0 $pid || { echo "App exited early"; exit 1; }
+          kill $pid
+          # Loads sound, MP3 reading, hotkeys, images, stickers and drag and drop inside the packaged app.
+          "dist/Soundboard.app/Contents/MacOS/Soundboard" --self-test || { echo "Self-test failed with code $?"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}" Soundboard-Windows.exe Soundboard-macOS.zip
+          --repo "${{ github.repository }}" --title "Soundboard ${{ github.ref_name }}" --generate-notes

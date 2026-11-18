@@ -1,0 +1,16 @@
+# Test files
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.sound
+*.soundboard
+*.part
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+__pycache__/
+*.pyc
