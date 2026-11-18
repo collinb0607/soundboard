@@ -255,10 +255,44 @@ def icon_image(icon):
         return None
     if path not in _ICON_CACHE:
         try:
-            _ICON_CACHE[path] = Image.open(path).convert("RGBA")
+            im = Image.open(path).convert("RGBA")
+            _ICON_CACHE[path] = sticker_frame(im) if kind == "image" else im
         except Exception:
             _ICON_CACHE[path] = None
     return _ICON_CACHE[path]
+
+
+def sticker_frame(im, size=256):
+    """Your own picture styled like the built-in stickers: rounded corners, a white border,
+    and a thin soft outline around it. (Done when it's drawn; the file itself isn't changed.)"""
+    from PIL import Image, ImageDraw, ImageFilter
+    k = 3  # drawn 3x, then shrunk, for smooth edges
+    S = size * k
+    pad = int(S * 0.035)  # room for the outline
+    border = int(S * 0.045)  # the white border
+    r = int(S * 0.20)  # corner radius
+    out = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    box = (pad, pad, S - pad, S - pad)
+    # A thin soft dark outline, like the stickers' edge.
+    edge = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(edge).rounded_rectangle((box[0] - 2 * k, box[1] - 2 * k, box[2] + 2 * k, box[3] + 2 * k),
+                                           r + 2 * k, fill=110)
+    edge = edge.filter(ImageFilter.GaussianBlur(1.5 * k))
+    out.paste(Image.new("RGBA", (S, S), (45, 32, 70, 255)), (0, 0), edge)
+    # The white border.
+    white = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(white).rounded_rectangle(box, r, fill=255)
+    out.paste(Image.new("RGBA", (S, S), (255, 255, 255, 255)), (0, 0), white)
+    # The picture, with its own rounded corners, inside the border.
+    inner = (box[0] + border, box[1] + border, box[2] - border, box[3] - border)
+    side = inner[2] - inner[0]
+    pic = im.resize((side, side), Image.LANCZOS)
+    mask = Image.new("L", (side, side), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, side - 1, side - 1), max(1, r - border), fill=255)
+    flat = Image.new("RGBA", (side, side), (255, 255, 255, 255))  # see-through parts show white, like a sticker
+    flat.alpha_composite(pic)
+    out.paste(flat, (inner[0], inner[1]), mask)
+    return out.resize((size, size), Image.LANCZOS)
 
 
 def _rgb(c):
