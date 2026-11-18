@@ -643,7 +643,7 @@ class Engine:
             with self.lock:
                 self.outs["main"] = o
         except Exception as e:
-            problems.append(f"Couldn't open “{main_name}”: {e}")
+            problems.append(f"Couldn't open “{main_name}”: {e}" + cable_hint(main_name))
         mon_name = ""
         if monitor_on:
             mon_i, mon_name = pick(monitor, "Speakers")
@@ -653,7 +653,7 @@ class Engine:
                     with self.lock:
                         self.outs["monitor"] = o
                 except Exception as e:
-                    problems.append(f"Couldn't open “{mon_name}”: {e}")
+                    problems.append(f"Couldn't open “{mon_name}”: {e}" + cable_hint(mon_name))
         if mic_on and "main" in self.outs:
             ins, default_in = list_devices("input")
             inames = {n: i for i, n in ins}
@@ -1121,24 +1121,81 @@ class Chip(tk.Canvas):
 
 
 def scroll_wheel(widget, target):
-    """Mouse-wheel scrolling for a canvas while the pointer is over it."""
-    def wheel(e):
-        if sys.platform == "darwin":
-            target.yview_scroll(-e.delta, "units")
-        else:
-            target.yview_scroll(-int(e.delta / 120) or (-1 if e.delta > 0 else 1), "units")
+    """Mouse-wheel scrolling: the wheel scrolls `target` while the pointer is over `widget`
+    (or anything inside it). One handler for the whole app finds what's under the pointer."""
+    widget._wheel_target = target
+    root = widget._root()
+    if getattr(root, "_wheel_on", False):
+        return
+    root._wheel_on = True
 
-    def enter(e):
-        widget.bind_all("<MouseWheel>", wheel)
-        widget.bind_all("<Button-4>", lambda e: target.yview_scroll(-1, "units"))
-        widget.bind_all("<Button-5>", lambda e: target.yview_scroll(1, "units"))
+    def wheel(e, step=None):
+        try:
+            w = root.winfo_containing(e.x_root, e.y_root)
+        except (KeyError, tk.TclError):
+            return
+        while w is not None:
+            if isinstance(w, ttk.Treeview):
+                return  # lists scroll themselves
+            t = getattr(w, "_wheel_target", None)
+            if t is not None:
+                if step is None:
+                    step = -e.delta if sys.platform == "darwin" else (-int(e.delta / 120) or (-1 if e.delta > 0 else 1))
+                if (e.state & 0x1) and hasattr(t, "xview_scroll"):  # Shift + wheel: sideways
+                    t.xview_scroll(step, "units")
+                else:
+                    t.yview_scroll(step, "units")
+                return
+            w = w.master
+    root.bind_all("<MouseWheel>", wheel, add="+")
+    root.bind_all("<Button-4>", lambda e: wheel(e, -1), add="+")
+    root.bind_all("<Button-5>", lambda e: wheel(e, 1), add="+")
 
-    def leave(e):
-        widget.unbind_all("<MouseWheel>")
-        widget.unbind_all("<Button-4>")
-        widget.unbind_all("<Button-5>")
-    widget.bind("<Enter>", enter, add="+")
-    widget.bind("<Leave>", leave, add="+")
+
+class ScrollArea(tk.Frame):
+    """A frame whose content scrolls (both ways) when the window is too small for it, and
+    stretches to fill the window when it's bigger. Put widgets in .inner."""
+
+    def __init__(self, parent, bg):
+        super().__init__(parent, bg=bg)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.hbar = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.vbar.set, xscrollcommand=self.hbar.set,
+                              xscrollincrement=20, yscrollincrement=20)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self.win = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
+        self._pending = False
+        # Any size change (the window's or the content's) schedules one fit.
+        self.canvas.bind("<Configure>", lambda e: self._schedule())
+        self.inner.bind("<Configure>", lambda e: self._schedule())
+        scroll_wheel(self.canvas, self.canvas)
+
+    def _schedule(self):
+        if not self._pending:
+            self._pending = True
+            self.after_idle(self._fit)
+
+    def _fit(self):
+        self._pending = False
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if cw <= 1:  # not shown yet
+            return
+        rw, rh = self.inner.winfo_reqwidth(), self.inner.winfo_reqheight()
+        w, h = max(cw, rw), max(ch, rh)
+        if (w, h) != getattr(self, "_size", None):
+            self._size = (w, h)
+            self.canvas.itemconfigure(self.win, width=w, height=h)
+        self.canvas.configure(scrollregion=(0, 0, w, h))
+        for bar, need, grid in ((self.vbar, rh > ch, {"row": 0, "column": 1, "sticky": "ns"}),
+                                (self.hbar, rw > cw, {"row": 1, "column": 0, "sticky": "ew"})):
+            if need and not bar.winfo_ismapped():
+                bar.grid(**grid)
+            elif not need and bar.winfo_ismapped():
+                bar.grid_remove()
 
 
 def dialog(parent, title):
@@ -1190,6 +1247,30 @@ def ask_text(parent, title, prompt, initial=""):
 
 CABLE_URL = "https://existential.audio/blackhole/" if sys.platform == "darwin" else "https://vb-audio.com/Cable/"
 CABLE_NAME = "BlackHole 2ch" if sys.platform == "darwin" else "VB-CABLE"
+
+
+def cable_hint(name):
+    """What to try when a virtual cable won't open."""
+    if not is_cable(name):
+        return ""
+    alt = " Or choose “CABLE In 16ch”, the same cable." if "cable input" in name.lower() else ""
+    return f" If you just installed it, restart your PC.{alt}"
+
+
+def device_opens(name):
+    """True if this output device can be opened right now (a quick test, no sound)."""
+    import sounddevice as sd
+    for i, n in list_devices("output")[0]:
+        if n == name:
+            try:
+                info = sd.query_devices(i)
+                st = sd.OutputStream(device=i, samplerate=int(info["default_samplerate"]),
+                                     channels=min(2, int(info["max_output_channels"])), dtype="float32")
+                st.close()
+                return True
+            except Exception:
+                return False
+    return False
 
 
 def is_cable(name):
@@ -1244,6 +1325,9 @@ class DiscordSetup:
             outs, ins, d_in, d_out = [], [], "", ""
             log_error(f"Discord setup: {e}")
         cables = [n for n in outs if is_cable(n)]
+        working = [n for n in cables if n == s["output"] or device_opens(n)]  # (one that's open counts)
+        broken = [n for n in cables if n not in working]
+        cables = working
         speakers = [n for n in outs if not is_cable(n)]
         mics = [n for n in ins if not is_cable_mic(n)]
         cable_mics = [n for n in ins if is_cable_mic(n)]
@@ -1258,7 +1342,15 @@ class DiscordSetup:
         # 1. The cable.
         c = self._card("1. A virtual audio cable", "volume-2")
         self.v_cable = tk.StringVar(value=s["output"] if s["output"] in cables else (cables[0] if cables else ""))
-        if cables:
+        if broken and not cables:
+            self._text(c, f"It's installed, but Windows won't let the app use it yet ({', '.join(broken)}). "
+                          "Restart your PC (VB-CABLE needs that after installing), then click Check again.",
+                       muted=False, color=t["error"])
+            row = ttk.Frame(c)
+            row.pack(anchor="w", pady=(2, 2))
+            ttk.Button(row, text="Check again", command=self.check_again,
+                       image=ui_icon(row, "rotate-cw", 15), compound="left").pack(side="left")
+        elif cables:
             self._text(c, "Found it. The sounds and your voice will go into:", muted=False)
             if len(cables) > 1:
                 ttk.Combobox(c, values=cables, textvariable=self.v_cable, state="readonly", width=48).pack(
@@ -1897,6 +1989,9 @@ class BoardGrid(ttk.Frame):
         self.states = {}  # sound id -> "normal" / "hover" / "pressed" / "playing"
         self.drag = None
         self.c.bind("<Configure>", lambda e: self.after_idle(self.redraw))
+        self.c.bind("<B1-Motion>", self._canvas_motion)
+        self.c.bind("<ButtonRelease-1>", self._canvas_release)
+        self.pressed = None
 
     def board(self):
         return self.app.store.board()
@@ -2007,8 +2102,6 @@ class BoardGrid(ttk.Frame):
         c.tag_bind(tag, "<Enter>", lambda e, sid=s["id"]: self._hover(sid, True))
         c.tag_bind(tag, "<Leave>", lambda e, sid=s["id"]: self._hover(sid, False))
         c.tag_bind(tag, "<ButtonPress-1>", lambda e, sid=s["id"]: self._press(e, sid))
-        c.tag_bind(tag, "<B1-Motion>", lambda e, sid=s["id"]: self._motion(e, sid))
-        c.tag_bind(tag, "<ButtonRelease-1>", lambda e, sid=s["id"]: self._release(e, sid))
         c.tag_bind(tag, "<Button-3>", lambda e, sid=s["id"]: self._menu(e, sid))
         if sys.platform == "darwin":
             c.tag_bind(tag, "<Button-2>", lambda e, sid=s["id"]: self._menu(e, sid))
@@ -2037,24 +2130,40 @@ class BoardGrid(ttk.Frame):
             return
         self.set_state(sid, "hover" if on else "normal")
 
+    # Pressing a tile is bound to the tile, but the drag and the release are bound to the canvas:
+    # Tk sends those to the item that was pressed, and a tile's items get redrawn (replaced).
     def _press(self, e, sid):
         if self.arrange:
             s = self.sound(sid)
             x0, y0, _, _ = self.rect(s["x"], s["y"], s["size"])
-            self.drag = {"sid": sid, "ox": self.c.canvasx(e.x) - x0, "oy": self.c.canvasy(e.y) - y0}
+            self.drag = {"sid": sid, "ox": self.c.canvasx(e.x) - x0, "oy": self.c.canvasy(e.y) - y0,
+                         "at": (x0, y0)}
             self.c.tag_raise(f"t_{sid}")
             return
+        self.pressed = sid
         if self.states.get(sid) != "playing":
             self.set_state(sid, "pressed")
         self.app.play(sid)
+
+    def _canvas_motion(self, e):
+        if self.drag:
+            self._motion(e, self.drag["sid"])
+
+    def _canvas_release(self, e):
+        if self.drag:
+            self._release(e, self.drag["sid"])
+        elif getattr(self, "pressed", None):
+            sid, self.pressed = self.pressed, None
+            self._release(e, sid)
 
     def _motion(self, e, sid):
         if not self.drag:
             return
         s = self.sound(sid)
         px, py = self.c.canvasx(e.x) - self.drag["ox"], self.c.canvasy(e.y) - self.drag["oy"]
-        x0, y0, _, _ = self.rect(s["x"], s["y"], s["size"])
-        self.draw_tile(s, px - x0, py - y0)
+        ax, ay = self.drag["at"]
+        self.c.move(f"t_{sid}", px - ax, py - ay)  # move the tile as it is (no redraw)
+        self.drag["at"] = (px, py)
         self.c.tag_raise(f"t_{sid}")
         tx, ty = self.cell_at(px, py)
         self.c.delete("target")
@@ -2148,8 +2257,10 @@ class SoundboardApp:
     def __init__(self, root):
         self.root = root
         root.title(APP_NAME)
-        root.geometry("1300x900")
-        root.minsize(1200, 860)
+        # 1300 x 900 fits everything; smaller screens get what fits (Configure then scrolls).
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{min(1300, sw - 60)}x{min(900, sh - 90)}")
+        root.minsize(min(980, sw - 60), min(640, sh - 90))
         self.ui_queue = queue.Queue()
         root.report_callback_exception = self._report_error
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -2213,7 +2324,7 @@ class SoundboardApp:
         self.tab_board.pack(side="left")
         self.tab_conf.pack(side="left", padx=(6, 0))
         self.body = tk.Frame(root, bg=UI["bg"])
-        self.body.pack(fill="both", expand=True, padx=12, pady=(6, 12))
+        self.body.pack(fill="both", expand=True, padx=10, pady=(6, 12))
         self._build_board_tab()
         self._build_config_tab()
         self.show_tab("board")
@@ -2291,7 +2402,8 @@ class SoundboardApp:
     def _build_config_tab(self):
         t = UI
         fam = ui_family()
-        f = self.config_tab = tk.Frame(self.body, bg=t["bg"])
+        self.config_tab = ScrollArea(self.body, t["bg"])  # it scrolls when the window is small
+        f = self.config_tab.inner
         # The boards row: chips, then board actions.
         top = tk.Frame(f, bg=t["bg"])
         top.pack(fill="x", pady=(2, 8))
