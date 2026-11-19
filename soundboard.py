@@ -137,6 +137,11 @@ class Store:
                 pass
             self.data = self.fresh()
         s = self.data.setdefault("settings", {})
+        if "master" in s and "master_scale" not in s:
+            # Master volume used to top out at the file's own level (100%). Now that's 50%,
+            # and 100% doubles it: keep the same loudness the person had.
+            s["master"] = round(s["master"] / 2)
+            s["master_scale"] = 2
         for k, v in self.fresh()["settings"].items():
             s.setdefault(k, v)
         if not any(b["id"] == self.data.get("active") for b in self.data["boards"]):
@@ -147,7 +152,7 @@ class Store:
         board = {"id": new_id(), "name": "My Board", "sounds": []}
         return {"version": 1, "boards": [board], "active": board["id"],
                 "settings": {"output": "", "monitor_on": True, "monitor": "", "mic_on": False, "mic": "",
-                             "mic_volume": 100, "master": 100, "stop_hotkey": ""}}
+                             "mic_volume": 100, "master": 50, "master_scale": 2, "stop_hotkey": ""}}
 
     def save(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -2861,7 +2866,7 @@ class SoundboardApp:
     def _on_master(self, save=True):
         v = round(self.master_v.get())
         self.master_lbl.config(text=f"{v}%")
-        self.engine.master = v / 100
+        self.engine.master = v / 50  # 50% plays sounds as they are; 100% is twice as loud
         if save:
             self.store.settings["master"] = v
             self._save_later()
