@@ -30,14 +30,15 @@ jobs:
         with:
           python-version: "3.12"
       # Pinned to the versions the Windows build was tested with.
-      - run: python -m pip install pyinstaller==6.22.3 numpy==2.5.5 sounddevice==0.5.6 soundfile==0.14.0 pillow==13.0.0 pynput==1.8.2 tkinterdnd2==0.7.0
+      - run: python -m pip install pyinstaller==6.22.3 numpy==2.5.5 sounddevice==0.5.6 soundfile==0.14.0 pillow==13.0.0 pynput==1.8.2 imageio-ffmpeg==0.8.1 tkinterdnd2==0.7.0
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
         # One file, no console window. The stickers are bundled next to the app's code;
-        # the sound libraries (PortAudio, libsndfile) come from their packages' hooks.
+        # the sound libraries (PortAudio, libsndfile) come from their packages' hooks, and
+        # --collect-data bundles imageio-ffmpeg's FFmpeg binary.
         run: |
-          pyinstaller --noconfirm --icon assets/icon.ico --onefile --windowed --name CBs-Soundboard --add-data "stickers:stickers" --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 soundboard.py
+          pyinstaller --noconfirm --icon assets/icon.ico --onefile --windowed --name CBs-Soundboard --add-data "stickers:stickers" --collect-data imageio_ffmpeg --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 soundboard.py
           Move-Item dist/CBs-Soundboard.exe ${{ matrix.asset }}
 
       - name: Build (macOS)
@@ -46,7 +47,7 @@ jobs:
         # microphone if it says why, so that's added to its Info.plist (then it's re-signed).
         # ditto keeps the permissions and code signature that a plain zip would lose.
         run: |
-          pyinstaller --noconfirm --icon assets/icon.icns --windowed --name "CB's Soundboard" --osx-bundle-identifier com.offlinetoolkit.soundboard --add-data "stickers:stickers" --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin soundboard.py
+          pyinstaller --noconfirm --icon assets/icon.icns --windowed --name "CB's Soundboard" --osx-bundle-identifier com.offlinetoolkit.soundboard --add-data "stickers:stickers" --collect-data imageio_ffmpeg --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin soundboard.py
           plutil -insert NSMicrophoneUsageDescription -string "CB's Soundboard mixes your microphone into its output when you turn that on." "dist/CB's Soundboard.app/Contents/Info.plist"
           codesign --force --deep --sign - "dist/CB's Soundboard.app"
           ditto -c -k --keepParent "dist/CB's Soundboard.app" ${{ matrix.asset }}
@@ -60,7 +61,7 @@ jobs:
           Start-Sleep 20
           if ($p.HasExited) { throw "App exited early with code $($p.ExitCode)" }
           Stop-Process -Id $p.Id -Force
-          # Loads sound, MP3 reading, hotkeys, images, stickers and drag and drop inside the packaged app.
+          # Loads sound, MP3 reading, FFmpeg, hotkeys, images, stickers and drag and drop inside the packaged app.
           $t = Start-Process ./${{ matrix.asset }} -ArgumentList "--self-test" -PassThru -Wait
           if ($t.ExitCode -ne 0) { throw "Self-test failed with code $($t.ExitCode)" }
       - name: Smoke test (macOS)
@@ -71,6 +72,7 @@ jobs:
           sleep 20
           kill -0 $pid || { echo "App exited early"; exit 1; }
           kill $pid
+          find "dist/CB's Soundboard.app" -name 'ffmpeg-*' -perm -u+x | grep -q . || { echo "FFmpeg not bundled"; exit 1; }
           # Loads sound, MP3 reading, hotkeys, images, stickers and drag and drop inside the packaged app.
           "dist/CB's Soundboard.app/Contents/MacOS/CB's Soundboard" --self-test || { echo "Self-test failed with code $?"; exit 1; }
 

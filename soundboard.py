@@ -8,11 +8,13 @@ microphone optionally mixed in.
 Requirements:
     Python 3.8+ (with Tkinter, included in the python.org installers)
     numpy, sounddevice, soundfile -> playing and reading sounds (WAV, MP3, OGG, FLAC)
+    imageio-ffmpeg                -> FFmpeg, for every other kind of sound file (Opus, M4A, AAC,
+                                     WMA, the sound of a video...): those are converted to FLAC once
     Pillow                        -> buttons, stickers and your own images
     pynput                        -> global hotkeys
     tkinterdnd2                   -> drag and drop (optional: the app works without it)
     The app offers to install them on first run. Manual install, using the Python that runs the app:
-        python -m pip install numpy sounddevice soundfile Pillow pynput tkinterdnd2
+        python -m pip install numpy sounddevice soundfile Pillow pynput imageio-ffmpeg tkinterdnd2
 
 Run:
     python soundboard.py
@@ -37,8 +39,14 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "CB's Soundboard"
 DATA_FOLDER = "CBSoundboard"  # the boards and the library: %APPDATA%\CBSoundboard on Windows
-AUDIO_EXTS = (".wav", ".mp3", ".ogg", ".flac")
-AUDIO_TYPES = [("Sound files", "*.wav *.mp3 *.ogg *.flac"), ("All files", "*.*")]
+# Read directly (libsndfile), and the rest through FFmpeg (converted to FLAC when added).
+NATIVE_EXTS = (".wav", ".mp3", ".ogg", ".flac")
+FFMPEG_EXTS = (".opus", ".m4a", ".aac", ".wma", ".aif", ".aiff", ".webm", ".mp4", ".mov", ".mkv", ".avi",
+               ".m4v", ".3gp", ".amr", ".ac3")
+AUDIO_EXTS = NATIVE_EXTS + FFMPEG_EXTS
+AUDIO_TYPES = [("Sound files", " ".join("*" + e for e in NATIVE_EXTS + FFMPEG_EXTS[:6])),
+               ("Video files (their sound)", " ".join("*" + e for e in FFMPEG_EXTS[6:])), ("All files", "*.*")]
+FORMATS_TEXT = "WAV, MP3, OGG, FLAC, Opus, M4A/AAC, WMA, AIFF or a video"
 IMAGE_TYPES = [("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"), ("All files", "*.*")]
 SOUND_EXT, BOARD_EXT = ".sound", ".soundboard"
 SOUND_TYPES = [("CB's Soundboard sound", "*" + SOUND_EXT)]
@@ -48,7 +56,7 @@ COLUMNS = 8  # grid cells across: four large (2 x 1) buttons, or eight small (1 
 PRESET_COLORS = ["#f25757", "#f5a524", "#43b649", "#14b8a6", "#22b5e8", "#2f80ed",
                   "#7c3aed", "#c026d3", "#ec4899", "#a06cf0", "#6b7bf0", "#4f5bd5"]
 REQUIREMENTS = [("numpy", "numpy"), ("sounddevice", "sounddevice"), ("soundfile", "soundfile"),
-                ("PIL", "Pillow"), ("pynput", "pynput")]
+                ("PIL", "Pillow"), ("pynput", "pynput"), ("imageio_ffmpeg", "imageio-ffmpeg")]
 
 
 # --------------------------------------------------------------------------- #
@@ -498,6 +506,80 @@ def audio_length(path):
     return _LENGTHS[path]
 
 
+def can_decode(path, full=True):
+    """True if libsndfile can decode the whole file, not just read its header. Ogg Opus is
+    always False: libsndfile lists it, but fails partway through many real Opus files.
+    full=False only checks the header and the start (quick, for files already added)."""
+    try:
+        import soundfile as sf
+        with sf.SoundFile(path) as f:
+            if f.frames <= 0 or f.subtype == "OPUS":
+                return False
+            while len(f.read(65536, dtype="float32")):
+                if not full:
+                    break
+        return True
+    except Exception:
+        return False
+
+
+def find_ffmpeg():
+    """The FFmpeg that comes with imageio-ffmpeg (or one on the PATH), or None."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+def ffmpeg_to_flac(src, dest):
+    """Convert any file with sound in it (its first sound track) to FLAC. Returns None, or a
+    short reason it failed."""
+    ff = find_ffmpeg()
+    if not ff:
+        return "FFmpeg isn't installed, so this kind of file can't be read."
+    try:
+        r = subprocess.run([ff, "-nostdin", "-hide_banner", "-v", "error", "-y", "-i", src, "-map", "0:a:0", "-vn",
+                            "-c:a", "flac", "-sample_fmt", "s16", dest],
+                           capture_output=True, text=True, errors="replace", timeout=600, **_POPEN_FLAGS)
+    except subprocess.TimeoutExpired:
+        return "Converting it took too long."
+    except OSError as e:
+        return f"FFmpeg couldn't run: {e}"
+    if r.returncode != 0 or not can_decode(dest):
+        text = (r.stderr or "").strip().splitlines()
+        if any("matches no streams" in t or "does not contain any stream" in t for t in text):
+            return "There's no sound in this file."
+        if any("Invalid data found" in t for t in text):
+            return "This isn't a sound file the app can read (or it's damaged)."
+        return (text[-1] if text else "FFmpeg couldn't read it.")[:200]
+    return None
+
+
+def library_add_audio(src=None, data=None, name="sound.wav"):
+    """Put a sound file (a path, or bytes from a .sound file) into the library, ready to play:
+    files libsndfile can't decode are converted to FLAC with FFmpeg. Returns (library name,
+    None), or (None, reason)."""
+    base = os.path.basename(src) if src else name
+    copied = library_copy(base, data) if data is not None else library_copy(src)
+    path = library_path(copied)
+    if os.path.splitext(base)[1].lower() in NATIVE_EXTS and can_decode(path):
+        return copied, None
+    flac = f"{os.path.splitext(copied)[0]}.flac"
+    err = ffmpeg_to_flac(path, library_path(flac))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    if err:
+        try:
+            os.remove(library_path(flac))
+        except OSError:
+            pass
+        return None, err
+    return flac, None
+
+
 def check_audio(path):
     """None if the file can be played, else a short reason."""
     try:
@@ -509,7 +591,7 @@ def check_audio(path):
     except Exception as e:
         text = str(e)
         if "unknown format" in text.lower() or "format not recognised" in text.lower():
-            return "This isn't a WAV, MP3, OGG or FLAC file (or it's damaged)."
+            return "This isn't a sound file the app can read (or it's damaged)."
         return text.splitlines()[-1] if text else "The file can't be read."
 
 
@@ -999,8 +1081,7 @@ def _unpack_sound(z, e):
     apath = e.get("audio")
     if apath not in names:
         raise ValueError("The file has no sound in it.")
-    audio = library_copy("sound" + os.path.splitext(apath)[1], z.read(apath))
-    err = check_audio(library_path(audio))
+    audio, err = library_add_audio(data=z.read(apath), name="sound" + os.path.splitext(apath)[1])
     if err:
         raise ValueError(err)
     icon = e.get("icon") or {}
@@ -2091,7 +2172,7 @@ class BoardGrid(ttk.Frame):
         w = c.winfo_width()
         fam = ui_family()
         c.create_text(w / 2, 90, text="No sounds on this board yet", font=(fam, 15, "bold"), fill=UI["text"])
-        c.create_text(w / 2, 122, text="Drag sound files (WAV, MP3, OGG, FLAC) here, or add them in Configure.",
+        c.create_text(w / 2, 122, text="Drag sound files (WAV, MP3, OGG, FLAC, M4A...) here, or add them in Configure.",
                       font=(fam, 10), fill=UI["muted"])
         b = PillButton(c, "Add sounds", self.app.add_sounds, icon="plus", on_card=True)
         c.create_window(w / 2, 170, window=b)
@@ -2319,6 +2400,7 @@ class SoundboardApp:
         self._pump_ui()
         self.dnd = enable_drag_and_drop(root, self._on_drop)
         self.root.after(50, self.open_devices)
+        self.root.after(400, self.repair_sounds)
         self._tick()
 
     # ---- threads -------------------------------------------------------- #
@@ -2876,6 +2958,42 @@ class SoundboardApp:
             self.root.after_cancel(self._save_job)
         self._save_job = self.root.after(600, self.save)
 
+    def repair_sounds(self):
+        """Sounds in the library libsndfile can't decode (added before FFmpeg was used, like
+        many Ogg Opus files) are converted to FLAC once, in the background."""
+        todo = {}
+        for b in self.store.boards:
+            for s in b["sounds"]:
+                todo.setdefault(s.get("audio"), []).append(s)
+
+        def work():
+            fixed = {}
+            for name in list(todo):
+                path = library_path(name)
+                if not name or not os.path.exists(path) or can_decode(path, full=False):
+                    continue
+                flac = f"{os.path.splitext(name)[0]}.flac"
+                if ffmpeg_to_flac(path, library_path(flac)) is None:
+                    fixed[name] = flac
+                else:
+                    log_error(f"Couldn't convert {name} with FFmpeg")
+            if fixed:
+                self.ui(lambda: self._repaired(fixed, todo))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _repaired(self, fixed, todo):
+        for old, new in fixed.items():
+            for s in todo[old]:
+                s["audio"] = new
+            if self.edit and self.edit.get("audio") == old:
+                self.edit["audio"] = new
+        self.save()
+        self.store.tidy_library()
+        _LENGTHS.clear()
+        self.warm_cache()
+        if self.tab == "config" and self.edit:
+            self._update_editor()
+
     def warm_cache(self):
         paths = [(library_path(s["audio"]), s.get("trim")) for s in self.store.board()["sounds"]]
 
@@ -3059,7 +3177,7 @@ class SoundboardApp:
             img = round_image(18, 18, 5, s["color"], "#ffffff")
             self._swatch_imgs.append(img)
             tr.insert("", "end", iid=s["id"], text="  " + s["name"], image=img, values=(s.get("hotkey", ""),))
-        self.tree_hint.config(text="" if sounds else "No sounds yet. Add sound files (WAV, MP3, OGG, FLAC), or "
+        self.tree_hint.config(text="" if sounds else "No sounds yet. Add sound files (WAV, MP3, OGG, M4A...), or "
                                                      "import .sound files someone shared with you.")
         target = select if select in tr.get_children() else (self.edit_id if self.edit_id in tr.get_children()
                                                              else (sounds[0]["id"] if sounds else None))
@@ -3290,11 +3408,16 @@ class SoundboardApp:
         path = filedialog.askopenfilename(parent=self.root, title="Choose a sound file", filetypes=AUDIO_TYPES)
         if not path:
             return
-        err = check_audio(path)
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            audio, err = library_add_audio(path)
+        finally:
+            self.root.config(cursor="")
         if err:
             messagebox.showerror("Can't use this file", f"{os.path.basename(path)}:\n{err}")
             return
-        self.edit["audio"] = library_copy(path)
+        self.edit["audio"] = audio
         self.edit["trim"] = None
         self.dirty = True
         self._update_editor()
@@ -3506,15 +3629,21 @@ class SoundboardApp:
                 return
         board = self.store.board()
         added, bad = [], []
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
         for p in paths:
-            err = check_audio(p) if p.lower().endswith(AUDIO_EXTS) else "Not a WAV, MP3, OGG or FLAC file."
+            if not p.lower().endswith(AUDIO_EXTS):
+                bad.append(f"{os.path.basename(p)}: Not a sound file the app knows ({FORMATS_TEXT}).")
+                continue
+            audio, err = library_add_audio(p)
             if err:
                 bad.append(f"{os.path.basename(p)}: {err}")
                 continue
-            s = new_sound(nice_title(p), library_copy(p), self._next_color())
+            s = new_sound(nice_title(p), audio, self._next_color())
             s["x"], s["y"] = first_free(board["sounds"], s["size"])
             board["sounds"].append(s)
             added.append(s)
+        self.root.config(cursor="")
         self.after_add(added, bad)
 
     def after_add(self, added, bad):
@@ -3661,7 +3790,7 @@ class SoundboardApp:
         if boards:
             self.import_board(boards)
         if other and not (audio or sounds or boards):
-            messagebox.showinfo("Not a sound", "Drop WAV, MP3, OGG or FLAC files to add them, or .sound / "
+            messagebox.showinfo("Not a sound", f"Drop sound files ({FORMATS_TEXT}) to add them, or .sound / "
                                                ".soundboard files to import them.")
 
     # ---- the rest ------------------------------------------------------- #
@@ -3719,7 +3848,7 @@ def offer_install(root, missing):
         return False
     if not messagebox.askyesno("Install what CB's Soundboard needs?",
                                "CB's Soundboard needs a few free Python packages to play sound and use hotkeys:\n\n"
-                               f"{', '.join(missing)}\n\nInstall them now? (about 40 MB download)\n\n"
+                               f"{', '.join(missing)}\n\nInstall them now? (up to 70 MB download)\n\n"
                                f"This runs pip for the Python running this app:\n{sys.executable}"):
         return False
     wait = tk.Toplevel(root)
@@ -3803,6 +3932,8 @@ def self_test():
             raise RuntimeError("no MP3 support in libsndfile")
         from PIL import Image  # noqa: F401
         from pynput import keyboard  # noqa: F401
+        if not find_ffmpeg():
+            raise RuntimeError("FFmpeg missing")
         if len(stickers()) < 100 or not os.path.exists(os.path.join(STICKER_DIR, stickers()[0]["id"] + ".png")):
             raise RuntimeError("stickers missing")
         root = tk.Tk()

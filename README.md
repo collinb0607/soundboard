@@ -11,7 +11,7 @@ if you like. Your sounds never leave your computer. Works on Windows and macOS.
 
 ## Download
 Get the latest version from the [Releases page](https://github.com/collinb0607/soundboard/releases/latest).
-Nothing else to install.
+Nothing else to install: FFmpeg is built in.
 
 | Your computer | Download | First launch |
 |---|---|---|
@@ -69,13 +69,16 @@ Or by hand:
 Plugged something in after starting the app? Click **Refresh devices**.
 
 ## Sound files
-WAV, MP3, OGG and FLAC. Any sample rate, mono or stereo.
+WAV, MP3, OGG and FLAC play as they are. Opus, M4A/AAC, WMA, AIFF and the sound from a video
+(MP4, MOV, MKV, WebM...) work too: they're converted once, with the built-in FFmpeg, to a lossless
+FLAC copy in the app's library. Any sample rate, mono or stereo.
 
 ## Run from source (Python)
 ### Setup (one time)
 1. Install **Python 3.8+** from https://python.org. On Windows, tick **"Add Python to PATH"** during install.
 2. Run the app (see below). The first time, it offers to install what it needs (`numpy`,
-   `sounddevice`, `soundfile`, `Pillow`, `pynput` and `tkinterdnd2`, about 40 MB). Click **Yes**.
+   `sounddevice`, `soundfile`, `Pillow`, `pynput`, `imageio-ffmpeg` (which includes FFmpeg) and
+   `tkinterdnd2`, about 70 MB). Click **Yes**.
    You won't be asked again.
 
 ### Run
