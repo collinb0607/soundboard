@@ -25,7 +25,7 @@ On an Intel Mac, or any other system, run it from source with Python (below).
   and *Voice Clips*). Click **+** to add one; click the pencil on the open board to rename it, or
   right-click a board for more.
 - **Buttons your way.** Each sound has a name, a color (12 presets or any color you pick), a volume
-  and a hotkey. Give it one of the 180 built-in stickers, or your own picture (you crop it square).
+  (0–200%: 100% plays it as it is, higher boosts a quiet clip) and a hotkey. Give it one of the 180 built-in stickers, or your own picture (you crop it square).
   A button is either **wide** (icon and name) or **square** (just the icon).
 - **Trim long clips.** **Trim…** shows the sound's waveform: drag across it to draw a box around
   the part that should play, drag the box's edges to adjust it, or the bar along its top to move it.

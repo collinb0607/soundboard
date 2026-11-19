@@ -43,6 +43,7 @@ IMAGE_TYPES = [("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"), ("All files"
 SOUND_EXT, BOARD_EXT = ".sound", ".soundboard"
 SOUND_TYPES = [("CB's Soundboard sound", "*" + SOUND_EXT)]
 BOARD_TYPES = [("CB's Soundboard board", "*" + BOARD_EXT)]
+MAX_VOLUME = 200  # a sound's own volume goes up to 200% (a boost); 100% plays the file as it is
 COLUMNS = 8  # grid cells across: four large (2 x 1) buttons, or eight small (1 x 1) ones
 PRESET_COLORS = ["#f25757", "#f5a524", "#43b649", "#14b8a6", "#22b5e8", "#2f80ed",
                   "#7c3aed", "#c026d3", "#ec4899", "#a06cf0", "#6b7bf0", "#4f5bd5"]
@@ -2545,7 +2546,8 @@ class SoundboardApp:
         vf.grid(row=7, column=0, columnspan=3, sticky="ew")
         vf.columnconfigure(0, weight=1)
         self.v_volume = tk.DoubleVar(value=100)
-        ttk.Scale(vf, from_=0, to=100, variable=self.v_volume, command=lambda _: self._on_volume()).grid(
+        # 0-200%: 100% (the middle) plays the file as it is; above that boosts it.
+        ttk.Scale(vf, from_=0, to=MAX_VOLUME, variable=self.v_volume, command=lambda _: self._on_volume()).grid(
             row=0, column=0, sticky="ew")
         self.vol_lbl = tk.Label(vf, text="100%", bg="#ffffff", fg=t["text"], font=(fam, 11, "bold"), width=5)
         self.vol_lbl.grid(row=0, column=1, padx=(8, 0))
@@ -3208,6 +3210,9 @@ class SoundboardApp:
         if not self.edit or self._loading:
             return
         v = round(self.v_volume.get())
+        if 96 <= v <= 104 and v != 100:  # snap to 100%, so "as it is" is easy to get back to
+            v = 100
+            self.v_volume.set(100)
         self.vol_lbl.config(text=f"{v}%")
         if v != self.edit.get("volume"):
             self.edit["volume"] = v
